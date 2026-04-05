@@ -5,8 +5,6 @@ import { usePathname } from 'next/navigation'
 import { useState } from 'react'
 
 const links = [
-  { href: '/design-system', label: 'Design System' },
-  { href: '/knowledge-base', label: 'Knowledge Base' },
   { href: '/create', label: 'Create' },
 ]
 
