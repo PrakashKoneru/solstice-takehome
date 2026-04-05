@@ -25,7 +25,7 @@ export default function Navbar() {
             </span>
           </Link>
 
-          {/* Desktop links */}
+          {/* Desktop links + account badge */}
           <div className="hidden md:flex items-center gap-1">
             {links.map((link) => {
               const active = pathname === link.href
@@ -43,6 +43,14 @@ export default function Navbar() {
                 </Link>
               )
             })}
+
+            {/* Account badge */}
+            <div className="ml-3 flex items-center gap-2 rounded-full border border-slate-200 px-3 py-1.5 hover:bg-slate-50 cursor-pointer transition-colors">
+              <div className="h-6 w-6 rounded-full bg-indigo-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
+                T
+              </div>
+              <span className="text-sm font-medium text-slate-700">Takeda</span>
+            </div>
           </div>
 
           {/* Mobile hamburger */}

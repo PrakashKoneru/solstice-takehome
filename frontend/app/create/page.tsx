@@ -40,7 +40,6 @@ const PINNED_LINKS = [
 export default function CreatePage() {
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeSession, setActiveSession] = useState<Session | null>(null)
-  const [sidebarOpen, setSidebarOpen] = useState(true)
 
   // Chat state
   const [messages, setMessages] = useState<Message[]>([])
@@ -119,7 +118,7 @@ export default function CreatePage() {
     <div className="flex flex-1 overflow-hidden" style={{ height: 'calc(100vh - 64px)' }}>
 
       {/* Left sidebar */}
-      <aside className={`flex flex-col border-r border-slate-200 bg-white transition-all duration-200 ${sidebarOpen ? 'w-64' : 'w-0 overflow-hidden'} flex-shrink-0`}>
+      <aside className="flex flex-col border-r border-slate-200 bg-white w-64 flex-shrink-0">
         {/* Pinned nav items */}
         <div className="p-3 space-y-0.5">
           {PINNED_LINKS.map((link) => (
@@ -173,16 +172,6 @@ export default function CreatePage() {
       {/* Main area */}
       <div className="flex flex-1 overflow-hidden">
 
-        {/* Sidebar toggle button */}
-        <button
-          onClick={() => setSidebarOpen(!sidebarOpen)}
-          className="absolute left-0 top-20 z-10 ml-1 p-1.5 rounded-md text-slate-400 hover:text-slate-600 hover:bg-slate-100 transition-colors"
-          aria-label="Toggle sidebar"
-        >
-          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d={sidebarOpen ? 'M11 19l-7-7 7-7' : 'M13 5l7 7-7 7'} />
-          </svg>
-        </button>
 
         {/* Empty state */}
         {!activeSession && (
