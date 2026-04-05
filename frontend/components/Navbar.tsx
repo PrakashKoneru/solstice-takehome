@@ -4,9 +4,7 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useState } from 'react'
 
-const links = [
-  { href: '/create', label: 'Create' },
-]
+const links: { href: string; label: string }[] = []
 
 export default function Navbar() {
   const pathname = usePathname()
@@ -42,12 +40,12 @@ export default function Navbar() {
               )
             })}
 
-            {/* Account badge */}
+            {/* Account badge — org name will come from auth context */}
             <div className="ml-3 flex items-center gap-2 rounded-full border border-slate-200 px-3 py-1.5 hover:bg-slate-50 cursor-pointer transition-colors">
               <div className="h-6 w-6 rounded-full bg-indigo-600 flex items-center justify-center text-white text-xs font-bold flex-shrink-0">
-                T
+                O
               </div>
-              <span className="text-sm font-medium text-slate-700">Takeda</span>
+              <span className="text-sm font-medium text-slate-700">Org Name</span>
             </div>
           </div>
 

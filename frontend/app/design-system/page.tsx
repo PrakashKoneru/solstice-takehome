@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import Sidebar from '@/components/Sidebar'
 
 type DesignSystem = {
   id: number
@@ -41,7 +42,10 @@ export default function DesignSystemPage() {
   }
 
   return (
-    <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+    <div className="flex overflow-hidden" style={{ height: 'calc(100vh - 64px)' }}>
+      <Sidebar sessions={[]} />
+      <div className="flex-1 overflow-y-auto">
+      <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
       <div>
         <h1 className="text-2xl font-bold text-slate-900">Design System</h1>
         <p className="mt-1 text-sm text-slate-500">
@@ -59,7 +63,7 @@ export default function DesignSystemPage() {
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. FRUZAQLA Brand 2024"
+              placeholder="e.g. Product Brand 2024"
               className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm text-slate-900 placeholder-slate-400 focus:border-indigo-500 focus:outline-none focus:ring-1 focus:ring-indigo-500"
               required
             />
@@ -153,6 +157,8 @@ export default function DesignSystemPage() {
       {systems.length === 0 && (
         <p className="text-center text-sm text-slate-400 py-8">No design systems uploaded yet.</p>
       )}
+      </div>
+      </div>
     </div>
   )
 }

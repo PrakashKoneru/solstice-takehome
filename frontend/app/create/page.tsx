@@ -78,27 +78,9 @@ export default function CreatePage() {
 
     // TODO: call API
     await new Promise((r) => setTimeout(r, 1500))
-    const mockHtml = `<div style="font-family: Arial, sans-serif; padding: 2.5rem; max-width: 860px; margin: 0 auto;">
-  <h1 style="color: #002855; font-size: 2rem; font-weight: 700; margin-bottom: 0.5rem;">FRUZAQLA®</h1>
-  <p style="color: #8C4799; font-size: 1rem; font-weight: 500; margin-bottom: 2rem;">fruquintinib capsules, 5 mg</p>
-  <h2 style="color: #002855; font-size: 1.25rem; margin-bottom: 1rem;">Proven Survival Benefit in mCRC</h2>
-  <p style="color: #333; line-height: 1.8; margin-bottom: 1.5rem;">
-    In the FRESCO-2 trial, FRUZAQLA + BSC demonstrated a statistically significant and clinically meaningful improvement in overall survival versus placebo + BSC in previously treated metastatic colorectal cancer.
-  </p>
-  <div style="background: #f8f4fc; border-left: 4px solid #8C4799; padding: 1.25rem 1.5rem; border-radius: 0 8px 8px 0; margin-bottom: 1.5rem;">
-    <p style="margin: 0; color: #8C4799; font-weight: 700; font-size: 0.875rem; text-transform: uppercase; letter-spacing: 0.05em;">Primary Endpoint — Overall Survival</p>
-    <p style="margin: 0.5rem 0 0; color: #002855; font-size: 1.5rem; font-weight: 700;">7.4 vs 4.8 months</p>
-    <p style="margin: 0.25rem 0 0; color: #555; font-size: 0.875rem;">HR=0.66 (95% CI: 0.55–0.80); P&lt;0.001 — 34% reduction in risk of death</p>
-  </div>
-  <div style="border-top: 1px solid #e5e7eb; padding-top: 1.25rem; margin-top: 2rem;">
-    <p style="font-size: 0.7rem; color: #888; line-height: 1.6;">
-      <strong>INDICATION:</strong> FRUZAQLA is indicated for the treatment of adult patients with metastatic colorectal cancer (mCRC) who have been previously treated with fluoropyrimidine-, oxaliplatin-, and irinotecan-based chemotherapy, an anti-VEGF biological therapy, and if RAS wild-type and medically appropriate, an anti-EGFR therapy.
-    </p>
-  </div>
-</div>`
 
-    setCurrentHtml(mockHtml)
-    setEditContent(mockHtml)
+    setCurrentHtml('')
+    setEditContent('')
 
     // Update session title from first message
     if (messages.length === 0 && activeSession) {
@@ -208,7 +190,7 @@ export default function CreatePage() {
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
                     </svg>
                     <p className="text-sm">Describe what you want to generate.</p>
-                    <p className="text-xs mt-1 max-w-xs">e.g. "Create a one-page efficacy slide for oncologists using the FRESCO-2 data"</p>
+                    <p className="text-xs mt-1 max-w-xs">e.g. "Create a one-page efficacy slide for oncologists"</p>
                   </div>
                 )}
                 {messages.map((msg, i) => (
