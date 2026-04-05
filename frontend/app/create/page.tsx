@@ -1,13 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 import Link from 'next/link'
-
-type Session = {
-  id: number
-  title: string
-  created_at: string
-}
+import { api, type Session } from '@/lib/api'
 
 type Message = {
   role: 'user' | 'assistant'
@@ -49,17 +44,28 @@ export default function CreatePage() {
   const [viewMode, setViewMode] = useState<ViewMode>('preview')
   const [editContent, setEditContent] = useState('')
 
-  function handleNewSession() {
-    const newSession: Session = {
-      id: Date.now(),
-      title: 'New Session',
-      created_at: new Date().toISOString().split('T')[0],
-    }
-    setSessions((prev) => [newSession, ...prev])
-    setActiveSession(newSession)
+  useEffect(() => {
+    api.sessions.list().then(setSessions).catch(console.error)
+  }, [])
+
+  async function handleNewSession() {
+    const session = await api.sessions.create('New Session')
+    setSessions((prev) => [session, ...prev])
+    setActiveSession(session)
     setMessages([])
     setCurrentHtml('')
     setEditContent('')
+  }
+
+  async function handleDeleteSession(id: number, e: React.MouseEvent) {
+    e.stopPropagation()
+    await api.sessions.delete(id)
+    setSessions((prev) => prev.filter((s) => s.id !== id))
+    if (activeSession?.id === id) {
+      setActiveSession(null)
+      setMessages([])
+      setCurrentHtml('')
+    }
   }
 
   function handleSelectSession(session: Session) {
@@ -82,11 +88,13 @@ export default function CreatePage() {
     setCurrentHtml('')
     setEditContent('')
 
-    // Update session title from first message
+    // Rename session from first message
     if (messages.length === 0 && activeSession) {
       const newTitle = userMessage.slice(0, 40)
-      setActiveSession((s) => s ? { ...s, title: newTitle } : s)
-      setSessions((prev) => prev.map((s) => s.id === activeSession.id ? { ...s, title: newTitle } : s))
+      api.sessions.update(activeSession.id, newTitle).then((updated) => {
+        setActiveSession(updated)
+        setSessions((prev) => prev.map((s) => s.id === updated.id ? updated : s))
+      })
     }
 
     setMessages((prev) => [...prev, {
@@ -133,16 +141,25 @@ export default function CreatePage() {
           ) : (
             <ul className="space-y-0.5 px-2">
               {sessions.map((session) => (
-                <li key={session.id}>
+                <li key={session.id} className="group relative">
                   <button
                     onClick={() => handleSelectSession(session)}
-                    className={`w-full text-left rounded-lg px-3 py-2 text-sm transition-colors truncate ${
+                    className={`w-full text-left rounded-lg px-3 py-2 pr-8 text-sm transition-colors truncate ${
                       activeSession?.id === session.id
                         ? 'bg-slate-100 text-slate-900 font-medium'
                         : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
                     }`}
                   >
                     {session.title}
+                  </button>
+                  <button
+                    onClick={(e) => handleDeleteSession(session.id, e)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-500 transition-all"
+                    aria-label="Delete session"
+                  >
+                    <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                    </svg>
                   </button>
                 </li>
               ))}

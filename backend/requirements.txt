@@ -4,7 +4,6 @@ flask-sqlalchemy==3.1.1
 flask-migrate==4.0.7
 flask-admin==1.6.1
 psycopg2-binary==2.9.9
-pdfplumber==0.11.4
 anthropic==0.30.1
 python-dotenv==1.0.1
 werkzeug==3.0.3
