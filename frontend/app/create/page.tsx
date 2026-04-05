@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import Link from 'next/link'
 
 type Session = {
   id: number
@@ -15,15 +16,29 @@ type Message = {
 
 type ViewMode = 'preview' | 'edit'
 
-// Mock sessions for UI development
-const MOCK_SESSIONS: Session[] = [
-  { id: 1, title: 'FRUZAQLA HCP Email — Q3', created_at: '2024-01-15' },
-  { id: 2, title: 'Efficacy Slide Deck Draft', created_at: '2024-01-14' },
-  { id: 3, title: 'Safety Profile Overview', created_at: '2024-01-13' },
+const PINNED_LINKS = [
+  {
+    href: '/design-system',
+    label: 'Design System',
+    icon: (
+      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
+      </svg>
+    ),
+  },
+  {
+    href: '/knowledge-base',
+    label: 'Knowledge Base',
+    icon: (
+      <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+      </svg>
+    ),
+  },
 ]
 
 export default function CreatePage() {
-  const [sessions, setSessions] = useState<Session[]>(MOCK_SESSIONS)
+  const [sessions, setSessions] = useState<Session[]>([])
   const [activeSession, setActiveSession] = useState<Session | null>(null)
   const [sidebarOpen, setSidebarOpen] = useState(true)
 
@@ -105,7 +120,21 @@ export default function CreatePage() {
 
       {/* Left sidebar */}
       <aside className={`flex flex-col border-r border-slate-200 bg-white transition-all duration-200 ${sidebarOpen ? 'w-64' : 'w-0 overflow-hidden'} flex-shrink-0`}>
-        <div className="p-3 border-b border-slate-200">
+        {/* Pinned nav items */}
+        <div className="p-3 space-y-0.5">
+          {PINNED_LINKS.map((link) => (
+            <Link
+              key={link.href}
+              href={link.href}
+              className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm text-slate-600 hover:bg-slate-100 hover:text-slate-900 transition-colors"
+            >
+              {link.icon}
+              {link.label}
+            </Link>
+          ))}
+        </div>
+
+        <div className="px-3 pb-2 border-b border-slate-200">
           <button
             onClick={handleNewSession}
             className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-100 transition-colors"
