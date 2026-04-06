@@ -1,8 +1,9 @@
 'use client'
 
 import Link from 'next/link'
-import { usePathname } from 'next/navigation'
+import { usePathname, useRouter } from 'next/navigation'
 import { useState } from 'react'
+import { api } from '@/lib/api'
 
 const PINNED_LINKS = [
   {
@@ -37,9 +38,22 @@ export default function Sidebar({ sessions, activeSessionId, onNewSession, onSel
   onSelectSession?: (id: number) => void
 }) {
   const pathname = usePathname()
+  const router = useRouter()
+  const [creating, setCreating] = useState(false)
+
+  async function handleNewSession() {
+    if (onNewSession) { onNewSession(); return }
+    setCreating(true)
+    try {
+      const session = await api.sessions.create('New Session')
+      router.push(`/create/${session.id}`)
+    } finally {
+      setCreating(false)
+    }
+  }
 
   return (
-    <aside className="flex flex-col border-r border-slate-200 bg-white w-64 flex-shrink-0 h-full">
+    <aside className="hidden md:flex flex-col border-r border-slate-200 bg-white w-64 flex-shrink-0">
       {/* Pinned links */}
       <div className="p-3 space-y-0.5">
         {PINNED_LINKS.map((link) => {
@@ -63,27 +77,16 @@ export default function Sidebar({ sessions, activeSessionId, onNewSession, onSel
 
       {/* New session button */}
       <div className="px-3 pb-2 border-b border-slate-200">
-        {onNewSession ? (
-          <button
-            onClick={onNewSession}
-            className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-100 transition-colors"
-          >
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-            </svg>
-            New session
-          </button>
-        ) : (
-          <Link
-            href="/create"
-            className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-100 transition-colors"
-          >
-            <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
-            </svg>
-            New session
-          </Link>
-        )}
+        <button
+          onClick={handleNewSession}
+          disabled={creating}
+          className="flex w-full items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-medium text-slate-700 hover:bg-slate-100 transition-colors disabled:opacity-50"
+        >
+          <svg className="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 4v16m8-8H4" />
+          </svg>
+          {creating ? 'Starting…' : 'New session'}
+        </button>
       </div>
 
       {/* Session list */}
@@ -95,7 +98,7 @@ export default function Sidebar({ sessions, activeSessionId, onNewSession, onSel
             {sessions.map((session) => (
               <li key={session.id}>
                 <button
-                  onClick={() => onSelectSession?.(session.id)}
+                  onClick={() => onSelectSession ? onSelectSession(session.id) : router.push(`/create/${session.id}`)}
                   className={`w-full text-left rounded-lg px-3 py-2 text-sm transition-colors truncate ${
                     activeSessionId === session.id
                       ? 'bg-slate-100 text-slate-900 font-medium'

@@ -4,7 +4,9 @@ import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useState } from 'react'
 
-const links: { href: string; label: string }[] = []
+const desktopLinks: { href: string; label: string }[] = []
+
+const mobileLinks: { href: string; label: string }[] = []
 
 export default function Navbar() {
   const pathname = usePathname()
@@ -23,7 +25,7 @@ export default function Navbar() {
 
           {/* Desktop links + account badge */}
           <div className="hidden md:flex items-center gap-1">
-            {links.map((link) => {
+            {desktopLinks.map((link) => {
               const active = pathname === link.href
               return (
                 <Link
@@ -71,7 +73,7 @@ export default function Navbar() {
       {/* Mobile menu */}
       {open && (
         <div className="md:hidden border-t border-slate-200 bg-white px-4 py-2">
-          {links.map((link) => {
+          {mobileLinks.map((link) => {
             const active = pathname === link.href
             return (
               <Link

@@ -30,6 +30,10 @@ def update_session(session_id):
 
     if 'title' in data:
         session.title = data['title'].strip() or session.title
+    if 'selected_ds_id' in data:
+        session.selected_ds_id = data['selected_ds_id']  # int or null
+    if 'selected_doc_ids' in data:
+        session.selected_doc_ids = data['selected_doc_ids']  # list of ints
 
     db.session.commit()
     return jsonify(session.to_dict())
