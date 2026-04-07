@@ -13,9 +13,12 @@ from extensions import db, migrate
 def create_app():
     app = Flask(__name__)
 
-    app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv(
-        'DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/solstice'
-    )
+    db_url = os.getenv('DATABASE_URL', 'postgresql://postgres:postgres@localhost:5432/solstice')
+    # psycopg3 requires postgresql+psycopg:// scheme
+    if db_url.startswith('postgresql://') or db_url.startswith('postgres://'):
+        db_url = db_url.replace('postgres://', 'postgresql://', 1)
+        db_url = db_url.replace('postgresql://', 'postgresql+psycopg://', 1)
+    app.config['SQLALCHEMY_DATABASE_URI'] = db_url
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
     app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-secret')
     app.config['UPLOAD_FOLDER'] = os.getenv('UPLOAD_FOLDER', 'uploads')
