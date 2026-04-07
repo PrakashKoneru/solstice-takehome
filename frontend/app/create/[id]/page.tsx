@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
 import { api, type Session, type DesignSystem, type KnowledgeItem, type Message as ApiMessage, type ReviewReport } from '@/lib/api'
@@ -31,7 +31,7 @@ function parseSlides(html: string): string[] {
   return [html]
 }
 
-function EditableSlide({ html, onSave, paneH }: { html: string; onSave: (updated: string) => void; paneH: number }) {
+const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }: { html: string; onSave: (updated: string) => void; paneH: number }) {
   const innerRef = useRef<HTMLDivElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
 
@@ -64,9 +64,9 @@ function EditableSlide({ html, onSave, paneH }: { html: string; onSave: (updated
       />
     </div>
   )
-}
+})
 
-function SlidePreview({ html, paneH }: { html: string; paneH: number }) {
+const SlidePreview = React.memo(function SlidePreview({ html, paneH }: { html: string; paneH: number }) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const innerRef = useRef<HTMLDivElement>(null)
 
@@ -96,7 +96,7 @@ function SlidePreview({ html, paneH }: { html: string; paneH: number }) {
       />
     </div>
   )
-}
+})
 
 const PINNED_LINKS = [
   {
