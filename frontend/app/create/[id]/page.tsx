@@ -339,6 +339,7 @@ export default function SessionPage() {
 
   async function handleSend() {
     if (!input.trim() || sending) return
+    if (selectedDocIds.size === 0) return
     const userMessage = input.trim()
     setInput('')
     setMessages((prev) => [...prev, { role: 'user', content: userMessage }])
