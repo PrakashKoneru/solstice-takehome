@@ -24,7 +24,11 @@ def create_app():
 
     db.init_app(app)
     migrate.init_app(app, db)
-    CORS(app, origins=['http://localhost:3000'])
+    CORS(app, origins=[
+        'http://localhost:3000',
+        'https://frontend-ten-umber-51.vercel.app',
+        r'https://.*\.vercel\.app',
+    ])
 
     from models import ChatSession, KnowledgeItem, DesignSystem, DesignSystemAsset, Message
     admin = Admin(app, name='ContentStudio', template_mode='bootstrap3')
