@@ -1,4 +1,6 @@
 import os
+import cloudinary
+import cloudinary.uploader
 from flask import Blueprint, jsonify, request, current_app
 from werkzeug.utils import secure_filename
 from extensions import db
@@ -65,6 +67,7 @@ def upload_design_system():
             asset_type=asset['asset_type'],
             file_url=asset['filepath'],
             filename=asset['filename'],
+            source=asset.get('source', 'raster'),
         ))
 
     db.session.commit()
@@ -119,16 +122,23 @@ def upload_asset(ds_id):
         return jsonify({'error': 'PNG, JPG, SVG, or WebP file required'}), 400
 
     filename = secure_filename(file.filename)
-    upload_dir = current_app.config['UPLOAD_FOLDER']
-    filepath = os.path.join(upload_dir, filename)
-    file.save(filepath)
+
+    result = cloudinary.uploader.upload(
+        file.stream,
+        folder='solstice/assets',
+        public_id=filename.rsplit('.', 1)[0],
+        overwrite=True,
+        resource_type='image',
+    )
+    file_url = result['secure_url']
 
     asset = DesignSystemAsset(
         design_system_id=ds_id,
         name=asset_name,
         asset_type=asset_type,
-        file_url=filepath,
+        file_url=file_url,
         filename=filename,
+        source='raster',
     )
     db.session.add(asset)
     db.session.commit()

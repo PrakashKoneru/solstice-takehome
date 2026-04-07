@@ -1,6 +1,7 @@
 'use client'
 
 import React, { useState, useEffect, useRef } from 'react'
+import ReactMarkdown from 'react-markdown'
 import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
 import { api, type Session, type DesignSystem, type KnowledgeItem, type Message as ApiMessage, type ReviewReport } from '@/lib/api'
@@ -191,6 +192,7 @@ export default function SessionPage() {
 
   const [designSystems, setDesignSystems] = useState<DesignSystem[]>([])
   const [selectedDsId, setSelectedDsId] = useState<number | ''>('')
+  const [targetAudience, setTargetAudience] = useState<string>('')
   const [kbDocs, setKbDocs] = useState<KnowledgeItem[]>([])
   const [selectedDocIds, setSelectedDocIds] = useState<Set<number>>(new Set())
   const contextRestoredRef = useRef(false)
@@ -211,6 +213,21 @@ export default function SessionPage() {
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
+
+  const selectedDs = designSystems.find((d) => d.id === selectedDsId)
+  const audienceOptions = selectedDs?.brand_guidelines?.supportedAudiences ?? []
+
+  // Auto-default audience when DS changes and has supported_audiences
+  useEffect(() => {
+    if (selectedDs?.brand_guidelines?.supportedAudiences?.length) {
+      const options = selectedDs.brand_guidelines.supportedAudiences
+      if (!options.includes(targetAudience)) {
+        const first = options[0]
+        setTargetAudience(first)
+        if (typeof window !== 'undefined') localStorage.setItem(`audience-${id}`, first)
+      }
+    }
+  }, [selectedDsId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     api.sessions.list().then(setSessions).catch(console.error)
@@ -249,6 +266,8 @@ export default function SessionPage() {
     setVersions([])
     setActiveVersionIdx(null)
     setSelectedVersionIdx(null)
+    const savedAudience = typeof window !== 'undefined' ? (localStorage.getItem(`audience-${id}`) ?? '') : ''
+    setTargetAudience(savedAudience)
     api.chat.list(numId).then((msgs: ApiMessage[]) => {
       setMessages(msgs.map((m) => ({ role: m.role, content: m.content })))
       const versionList: Version[] = []
@@ -339,7 +358,11 @@ export default function SessionPage() {
 
   async function handleSend() {
     if (!input.trim() || sending) return
-    if (selectedDocIds.size === 0) return
+    if (selectedDocIds.size === 0) {
+      setMessages((prev) => [...prev, { role: 'user', content: input.trim() }, { role: 'assistant', content: 'Please select a Knowledge Base document before sending a message.' }])
+      setInput('')
+      return
+    }
     const userMessage = input.trim()
     setInput('')
     setMessages((prev) => [...prev, { role: 'user', content: userMessage }])
@@ -355,15 +378,19 @@ export default function SessionPage() {
         Array.from(selectedDocIds),
         mode,
         currentHtml || null,
+        targetAudience || undefined,
       )
       setMessages((prev) => [...prev, { role: 'assistant', content: assistant.content }])
       if (assistant.html_content) {
+        const htmlChanged = assistant.html_content !== currentHtml
         setCurrentHtml(assistant.html_content)
         setEditContent(assistant.html_content)
         setCurrentReview(assistant.review_report ?? null)
         setReviewOpen(false)
         setViewMode('preview')
-        appendVersion(assistant.html_content, userMessage, assistant.review_report ?? null)
+        if (htmlChanged) {
+          appendVersion(assistant.html_content, userMessage, assistant.review_report ?? null)
+        }
       }
       if (isFirstMessage && activeSession) {
         const newTitle = userMessage.slice(0, 40)
@@ -507,6 +534,27 @@ export default function SessionPage() {
               </select>
             </div>
 
+            {/* Audience selector — only shown when DS has identified audiences */}
+            {audienceOptions.length > 0 && (
+              <div className="flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-xs">
+                <svg className="h-3.5 w-3.5 text-indigo-500 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                <select
+                  value={targetAudience}
+                  onChange={(e) => {
+                    setTargetAudience(e.target.value)
+                    if (typeof window !== 'undefined') localStorage.setItem(`audience-${id}`, e.target.value)
+                  }}
+                  className="bg-transparent text-slate-700 font-medium focus:outline-none cursor-pointer max-w-[120px] truncate"
+                >
+                  {audienceOptions.map((a) => (
+                    <option key={a} value={a}>{a}</option>
+                  ))}
+                </select>
+              </div>
+            )}
+
             {/* Knowledge docs picker */}
             <div className="relative" ref={docPickerRef}>
               <button
@@ -631,7 +679,23 @@ export default function SessionPage() {
                   ? 'bg-indigo-600 text-white rounded-br-sm'
                   : 'bg-slate-100 text-slate-800 rounded-bl-sm'
               }`}>
-                {msg.content}
+                {msg.role === 'assistant' ? (
+                  <ReactMarkdown
+                    components={{
+                      p: ({ children }) => <p className="mb-1 last:mb-0">{children}</p>,
+                      strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                      ul: ({ children }) => <ul className="list-disc pl-4 mb-1">{children}</ul>,
+                      ol: ({ children }) => <ol className="list-decimal pl-4 mb-1">{children}</ol>,
+                      li: ({ children }) => <li className="mb-0.5">{children}</li>,
+                      hr: () => <hr className="my-2 border-slate-300" />,
+                      table: ({ children }) => <table className="text-xs border-collapse w-full my-1">{children}</table>,
+                      th: ({ children }) => <th className="border border-slate-300 px-2 py-1 bg-slate-200 font-semibold">{children}</th>,
+                      td: ({ children }) => <td className="border border-slate-300 px-2 py-1">{children}</td>,
+                    }}
+                  >
+                    {msg.content}
+                  </ReactMarkdown>
+                ) : msg.content}
               </div>
             </div>
           ))}

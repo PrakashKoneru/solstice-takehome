@@ -49,18 +49,22 @@ def send_message(session_id):
     current_draft = data.get('current_draft') or None
     ds_id = data.get('design_system_id')
     kb_doc_ids = data.get('kb_doc_ids') or []
+    target_audience = data.get('target_audience') or None
 
     design_tokens    = None
     brand_guidelines = None
     slide_templates  = None
     ds_assets        = []
+    audience_rules   = None
     if ds_id:
         ds = DesignSystem.query.get(ds_id)
         if ds:
             design_tokens    = ds.tokens
             brand_guidelines = ds.brand_guidelines
             slide_templates  = ds.slide_templates
-            ds_assets        = DesignSystemAsset.query.filter_by(design_system_id=ds_id).all()
+            audience_rules   = (ds.brand_guidelines or {}).get('audienceRules') if ds else None
+            raw_assets = DesignSystemAsset.query.filter_by(design_system_id=ds_id).all()
+            ds_assets = [a.to_dict() for a in raw_assets]
 
     # Build conversation history from existing session messages (before adding new user msg)
     prior_messages = (
@@ -107,10 +111,12 @@ def send_message(session_id):
             design_tokens=design_tokens,
             brand_guidelines=brand_guidelines,
             slide_templates=slide_templates,
-            ds_assets=[a.to_dict() for a in ds_assets],
+            ds_assets=ds_assets,
             kb_texts=kb_texts,
             current_draft=current_draft,
             history=history,
+            target_audience=target_audience,
+            audience_rules=audience_rules,
         )
         # Find first HTML tag — model may prepend explanation text despite instructions
         html_match = re.search(r'<(?:div|html|section)', raw, re.IGNORECASE)
@@ -132,14 +138,35 @@ def send_message(session_id):
             history=slim_history,
             brand_guidelines=brand_guidelines,
             slide_templates=slide_templates,
-            ds_assets=[a.to_dict() for a in ds_assets],
+            ds_assets=ds_assets,
+            target_audience=target_audience,
+            audience_rules=audience_rules,
         )
+
+    # ── If generation ran, get a meaningful summary from the chat agent ───────
+    if html_content and not chat_text:
+        summary_prompt = (
+            f"Slides were just generated in response to this request: \"{prompt}\". "
+            "In 1–2 sentences, tell the user what was produced and what they should look for in the output panel. "
+            "Be specific — mention layout type, key data, or any notable elements if you can infer them from the request."
+        )
+        try:
+            chat_text = chat_response(
+                summary_prompt,
+                kb_texts=None,
+                history=slim_history,
+                brand_guidelines=None,
+                slide_templates=None,
+                ds_assets=None,
+            )
+        except Exception:
+            chat_text = 'Slides generated — check the output panel.'
 
     # ── Assemble message ──────────────────────────────────────────────────────
     assistant_msg = Message(
         session_id=session_id,
         role='assistant',
-        content=chat_text or ('Content generated successfully.' if html_content else ''),
+        content=chat_text or 'Slides generated — check the output panel.',
         html_content=html_content,
         review_report=review_report,
     )

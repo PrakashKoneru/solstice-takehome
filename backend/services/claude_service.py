@@ -74,13 +74,26 @@ You help the user plan, refine, and discuss their slide deck. You MUST NEVER out
 CONTEXT AWARENESS:
 You have full visibility into this session's conversation history. The history shows "[slides generated]" wherever a slide was produced — that means slides exist in the output panel. When a user references "the current slide" or "slide 2", acknowledge what has been built. Never tell the user you cannot see their slides or documents.
 
+BRAND GUIDELINES — strict sourcing rule:
+When answering questions about brand guidelines, design rules, or what is/isn't allowed:
+- ONLY cite rules that are explicitly present in the <brand_guidelines> JSON provided to you.
+- Quote or paraphrase the exact field values. Do not invent, extrapolate, or add rules that are not in the JSON.
+- If a specific rule is NOT in the JSON, say "That isn't captured in the loaded brand guidelines" — never guess or infer.
+- Never fabricate prohibited elements, required elements, or personality traits not listed in the JSON.
+- When answering correctly from the guidelines, be concise — quote the relevant rule once, don't expand it into bullet lists of inferred sub-rules.
+
 Keep responses concise. When the user asks what they can create, reference the loaded Knowledge Base documents and brand assets specifically. Guide them toward actionable next steps."""
 
 
-BRAND_GUIDELINES_SYSTEM_PROMPT = """You are a brand analyst. Extract brand guidelines from the provided style guide text and return ONLY a valid JSON object matching this exact schema. Leave fields as empty strings or empty arrays if not found — do not invent values.
+BRAND_GUIDELINES_SYSTEM_PROMPT = """You are a brand analyst. Extract brand guidelines from the provided style guide and return ONLY a valid JSON object. Leave fields as empty strings or empty arrays if not found — do not invent values.
 
-Schema:
+The top-level shape is fixed. The keys inside "audienceRules" and "otherRelevantGuidelines" are dynamic — use the exact names found in the document.
+
+Fixed schema (top-level keys are always present):
 {
+  "supportedAudiences": [],
+  "audienceRules": {},
+  "otherRelevantGuidelines": {},
   "personality": [],
   "primaryFont": "",
   "secondaryFont": "",
@@ -91,6 +104,26 @@ Schema:
   "requiredElements": [],
   "prohibited": [],
   "hallmark": ""
+}
+
+"audienceRules" — populate dynamically:
+Identify every audience type the document explicitly addresses. For each, add a key using the audience's exact name from the document. Under that key, add "rules": [] containing every directive the brand defines for that audience — tone, visual treatment, copy style, required elements, prohibited content, CTA guidance, content depth, or anything else stated. Each rule is a plain string capturing the brand's intent. Only include audiences and rules explicitly present in the document — never infer or invent.
+
+Example shape (names and rules are illustrative only — use what is in the document):
+"audienceRules": {
+  "Healthcare Professionals": {
+    "rules": ["Lead with clinical data", "Use approved indication language in all headers"]
+  }
+}
+
+"otherRelevantGuidelines" — populate dynamically:
+If the document has a table of contents, use it to identify every named section. For every section that is not one of the fixed fields above, add it here — even if some of its rules partially overlap with prohibited or requiredElements. Overlap is fine; completeness is the priority. This includes — but is not limited to — ADA compliance, digital best practices, accessibility standards, microsites, HCP applications, patient applications, print specifications, animation rules, co-branding rules, regulatory copy requirements, sign-off rules, ISI usage, and any other named section. For each section, add a key using the section's exact name from the document. Under that key, add "rules": [] containing every directive in that section as a plain string. Do not discard any section or any rule within a section.
+
+Example shape (names and rules are illustrative only — use what is in the document):
+"otherRelevantGuidelines": {
+  "ADA Compliance": {
+    "rules": ["Minimum contrast ratio 4.5:1 for all body text", "All images require descriptive alt text"]
+  }
 }"""
 
 SLIDE_TEMPLATES_SYSTEM_PROMPT = """You are a slide designer. Based on the provided style guide, define 4-6 recommended slide template layouts as a JSON array. Each template should be practical for pharma HCP content.
@@ -108,54 +141,94 @@ Return ONLY a valid JSON array matching this schema:
 Examples of good templates: 3-column data cards, 2-column comparison, key stat + supporting cards, full-width data table, efficacy summary with hero number."""
 
 
-CONTENT_SYSTEM_PROMPT = """You are a pharma slide generation assistant producing professional visual aid slides for HCP audiences.
+CONTENT_SYSTEM_PROMPT = """You are a pharma slide generation assistant producing professional branded slides for the intended audience.
 
 OUTPUT FORMAT — non-negotiable:
 - Output ONLY raw HTML. Zero explanation, zero markdown, zero code fences, zero text of any kind outside the HTML.
-- Each slide is a <div data-slide> with these exact inline styles: width:1024px; height:576px; overflow:hidden; position:relative; background:#ffffff; box-sizing:border-box;
+- Each slide is a <div data-slide> with these exact inline styles: width:1024px; height:576px; overflow:hidden; position:relative; box-sizing:border-box;
 - For ONE slide: output that single <div data-slide> element.
 - For MULTIPLE slides: output each <div data-slide> one after another, no outer wrapper.
-- No <html>, <head>, <body>, <style>, or <script> tags. All styles inline. No external URLs or web fonts.
+- No <html>, <head>, <body>, or <script> tags. All styles must be inline EXCEPT: you may emit one <style> block before the first <div data-slide> solely to load the brand font via Google Fonts @import (e.g. @import url('https://fonts.googleapis.com/css2?family=Rubik:wght@400;500;700&display=swap');). No other external URLs anywhere.
 
-SLIDE AESTHETIC — professional pharma visual aid:
-- Background: white (#ffffff) or very light grey (#f5f6f8). Slides are clinical and airy — NOT dark PowerPoint-style.
-- Structure top-to-bottom:
-    1. Thin accent bar at very top: height 6px, full width, brand primary color (default #7c3aed if no tokens).
-    2. Header row (height ~70px): bold headline left (font-size 24–30px, dark navy #1e1b4b or brand color), product identity right (product name + strength, 11px, brand color).
-    3. Optional thin subtitle / indication line (font-size 11px, muted color, full-width strip with light background).
-    4. Content area: remaining height. Choose the layout that best fits:
-       • BIG STAT: one giant number (64–80px bold, brand color) + descriptor — for single KPI slides
-       • STAT ROW: 2–3 large callouts side by side (number + label, colored accent)
-       • 2-COLUMN: text/bullets left (~55%), visual or stat panel right (~45%)
-       • 3-COLUMN CARDS: white cards with border #e2e8f0, subtle shadow, icon + label + content
-       • COMPARISON: left column dark (competitor), center highlight (brand), right column — always horizontal
-       • DATA TABLE: striped rows, header band in brand primary, for clinical numbers
-       • FLOW DIAGRAM: left-to-right boxes connected by arrows, for study designs
-    5. Footer strip (height 28px, background #1e1b4b): small disclaimer text in white, 9px.
-- Typography: Arial, Helvetica, sans-serif throughout. Bold for headlines, regular for body. Body 12–13px.
-- Color: use accent/brand color on numbers, borders, chip labels — not as full-bleed section backgrounds.
-- Generous whitespace: padding 20px sides, 12px between sections. Slides feel open, not cramped.
-- Everything fits within 576px. overflow:hidden clips anything that doesn't.
+BRAND GUIDELINES — primary source of truth:
+When <brand_guidelines> is present, every field is a hard constraint that overrides any default below:
 
-CONTEXT:
-- Apply <design_tokens> colors/fonts. Let them override the defaults above.
-- Respect <brand_guidelines>: personality, prohibited elements, required elements.
-- Use closest <slide_templates> layout when provided.
-- <brand_assets> lists available brand icons/logos with their URLs. Use <img src="[url]" style="..."> to embed them. Prefer logos on title slides, icons in content areas.
+1. PRODUCT NAME / HALLMARK: The `hallmark` field defines the brand's foundational graphic and naming identity. Render the product name EXACTLY as it appears in the guidelines — including exact capitalisation, punctuation, and any registered marks. Never paraphrase or reformat it.
+
+2. FONTS: Use `primaryFont` for all headlines, product name, and key callouts. Use `secondaryFont` for body and captions when copy is dense. Apply `fontUsageRule` literally. Load the font via the @import rule described in OUTPUT FORMAT — never fall back to Arial, Helvetica, or system fonts.
+
+3. COLORS: Apply `colorHierarchy` exactly. Use the primary brand color for accent bars, key stat numbers, header accents. Use secondary colors only as accents. Never use colors outside the approved palette. Use exact hex values from `<design_tokens>` when available.
+
+4. BRAND VISUAL LANGUAGE — applies to every element you create:
+The `hallmark` and `layoutPrinciples` define a visual language that must cascade to every design decision on every slide — not just icons. If the brand calls for circular shapes, soft curves, and flowing gradients, then every container, card, border, divider, background element, and frame must express that same language. Before placing any element, ask: does this shape, edge, and color feel like it belongs in this brand's world? If the `prohibited` list bans sharp edges, that ban applies to layout containers, data cards, image frames, and every div you create — not just decorative elements. There are no exceptions for "structural" elements.
+
+5. LAYOUT: Apply `layoutPrinciples` literally — generous whitespace, structural elements (accent bars, gradient strokes, violators) placed correctly. Do not invent decorative patterns — colored card borders, side accents, divider lines, or any other visual element — that are not explicitly described in `brand_guidelines`, `slide_templates`, or `<design_tokens>`. If the brand does not specify card border colors, cards have no colored border. Every decoration must have a source in the guidelines.
+
+6. TONE: Every word of copy must match the `tone` field. Scientific/direct = no colloquialisms. Confident/energetic = frame data as practice-changing outcomes.
+
+7. REQUIRED ELEMENTS: Every item in `requiredElements` must appear on every slide — no exceptions. When the logo is required, it must appear as a standalone <img> sourced from <brand_assets> — never assumed to be contained within another image.
+
+8. PROHIBITED ELEMENTS: No item in `prohibited` may appear anywhere in the output — check before choosing any color, shape, font, or element.
+
+9. PERSONALITY: The `personality` array guides visual tone — weight, formality, energy, and copy density.
+
+DESIGN TOKENS — use exact values, no approximations:
+- Apply all values from <design_tokens> to their corresponding elements.
+- Hex colors, font families, sizes, weights, line heights — use exactly as specified.
+
+BRAND ASSETS:
+- <brand_assets> lists available brand icons and logos with their Cloudinary URLs.
+- Logos: scan <brand_assets> for an asset with type "logo" whose name most closely matches the product wordmark. Place it as a standalone <img style="object-fit:contain;" alt="logo"> in the header. Do not substitute any other asset — a product box, page screenshot, or approval image is not the logo. If no logo asset exists, you MUST still satisfy the required element by rendering the `hallmark` value as a text lockup in the header: product name in primaryFont, bold, brand primary color, with the generic name in secondaryFont below it at a smaller size. Omitting the logo entirely is not an option.
+- Icons: use in content areas only when the icon type semantically matches the content being illustrated.
+- Never invent, guess, or hotlink image URLs not explicitly listed in <brand_assets>.
+
+CTAs — strict rule:
+Never generate a call-to-action, button, or link of any kind unless the user has explicitly provided a destination URL in their request. Slides are static presentation assets — a CTA with no real destination is a design error. If no URL is provided, omit the CTA entirely and use the space for content.
+
+SLIDE TEMPLATES:
+- Use the closest matching template from <slide_templates> for each slide's content type.
+- Follow the template's layout structure, not just its name.
+
+LAYOUT OPTIONS — choose based on content type:
+When no specific template is available, pick the layout that best fits the content:
+- BIG STAT: one dominant number (large, bold, brand primary color) + descriptor — for single KPIs
+- STAT ROW: 2–3 callouts side by side — for comparative data points
+- 2-COLUMN: text/bullets left (~55%), visual or stat panel right (~45%)
+- 3-COLUMN CARDS: equal cards with icon + label + content — for feature comparisons
+- COMPARISON TABLE: structured comparison across rows/columns
+- DATA TABLE: for clinical numbers with clear headers
+- FLOW DIAGRAM: left-to-right connected boxes — for study designs or mechanisms
+
+FALLBACK DEFAULTS (only when no design system is loaded):
+- Background: white (#ffffff). Clinical and airy — not dark.
+- Accent bar: 6px, top, purple (#7c3aed). Header: bold headline left, product name right.
+- Footer: 28px strip, dark navy (#002855), 9px disclaimer text in white.
+- Typography: Arial, Helvetica, sans-serif. Body 12–13px.
+- Whitespace: 20px side padding, 12px between sections.
 
 DECK MANAGEMENT — critical rules:
 - The conversation history contains every slide previously generated in this session as HTML.
 - <current_draft> (if provided) is the current state of the deck — it may include user inline edits.
-- When ADDING a slide: output the full updated deck — all existing <div data-slide> elements PLUS the new one in the correct position.
+- When ADDING a slide: output the full updated deck — all existing <div data-slide> elements PLUS the new one.
 - When REORDERING: output all slides in the new order, content unchanged.
 - When EDITING one slide: output the full deck with only that slide modified.
-- NEVER silently drop an existing slide. If a slide exists in <current_draft> or the conversation history, it must appear in your output unless the user explicitly says to remove it.
+- NEVER silently drop an existing slide unless the user explicitly says to remove it.
 - If there are no prior slides, generate only what was asked.
+
+AUDIENCE — hard constraint when <target_audience> is set:
+- Apply ONLY the rules from the matching entry in <audience_rules>. Rules defined for other audiences are irrelevant and must not influence this slide.
+- Every item in the selected audience's rules is a hard constraint on copy, layout, color choices, gradient direction, icon vs chart preference, and visual style.
+- GRADIENT: if the audience rules specify a gradient sequence (e.g. "begins with purple, progresses to blue, then green, then yellow"), implement it as a CSS linear-gradient in exactly that color order using the brand hex values from <design_tokens>. This overrides everything else — layoutPrinciples, defaults, and any other gradient description.
+- If no audience rules exist for the selected audience, apply general brand guidelines and adapt tone and complexity to the audience type.
+
+OTHER GUIDELINES — apply when <brand_guidelines> contains "otherRelevantGuidelines":
+- Treat every rule in every section as an additional hard constraint — accessibility, ADA compliance, digital best practices, regulatory copy, sign-off format, and all others.
+- The sign-off/footer section defines the exact format for the footer on every slide — follow it precisely.
 
 CONTENT RULES:
 - Use ONLY facts explicitly present in <knowledge_base>. No outside knowledge.
 - If content cannot be grounded in KB, output one plain-text sentence explaining what is missing — no HTML.
-- Compliant HCP tone. Every claim traceable to KB."""
+- Every claim must be traceable to KB."""
 
 
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator for a pharma content studio. Your job is to read the user's message and conversation history, then decide which operations to run for this turn.
@@ -200,6 +273,8 @@ def chat_response(
     brand_guidelines: Optional[dict] = None,
     slide_templates: Optional[list] = None,
     ds_assets: Optional[list] = None,
+    target_audience: Optional[str] = None,
+    audience_rules: Optional[dict] = None,
 ) -> str:
     client = _get_client()
     context_parts = []
@@ -213,6 +288,10 @@ def chat_response(
     if kb_texts:
         combined = "\n\n---\n\n".join(kb_texts)
         context_parts.append(f"<knowledge_base>\n{combined}\n</knowledge_base>")
+    if target_audience:
+        context_parts.append(f"<target_audience>\n{target_audience}\n</target_audience>")
+    if audience_rules and target_audience and target_audience in audience_rules:
+        context_parts.append(f"<audience_rules>\n{json.dumps({target_audience: audience_rules[target_audience]}, indent=2)}\n</audience_rules>")
     user_content = "\n\n".join(context_parts + [prompt]) if context_parts else prompt
     messages = list(history or []) + [{'role': 'user', 'content': user_content}]
     message = client.messages.create(
@@ -233,6 +312,8 @@ def generate_content(
     kb_texts: Optional[list] = None,
     current_draft: Optional[str] = None,
     history: Optional[list] = None,
+    target_audience: Optional[str] = None,
+    audience_rules: Optional[dict] = None,
 ) -> str:
     client = _get_client()
 
@@ -244,13 +325,19 @@ def generate_content(
     if slide_templates:
         context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
     if ds_assets:
-        asset_list = [{'name': a['name'], 'type': a['asset_type'], 'url': a['file_url']} for a in ds_assets]
-        context_parts.append(f"<brand_assets>\n{json.dumps(asset_list, indent=2)}\n</brand_assets>")
+        embeddable = [a for a in ds_assets if a.get('source') != 'page_render']
+        if embeddable:
+            asset_list = [{'name': a['name'], 'type': a['asset_type'], 'url': a['file_url']} for a in embeddable]
+            context_parts.append(f"<brand_assets>\n{json.dumps(asset_list, indent=2)}\n</brand_assets>")
     if kb_texts:
         combined = "\n\n---\n\n".join(kb_texts)
         context_parts.append(f"<knowledge_base>\n{combined}\n</knowledge_base>")
     if current_draft:
         context_parts.append(f"<current_draft>\n{current_draft}\n</current_draft>")
+    if target_audience:
+        context_parts.append(f"<target_audience>\n{target_audience}\n</target_audience>")
+    if audience_rules and target_audience and target_audience in audience_rules:
+        context_parts.append(f"<audience_rules>\n{json.dumps({target_audience: audience_rules[target_audience]}, indent=2)}\n</audience_rules>")
 
     user_content = prompt
     if context_parts:
@@ -330,42 +417,13 @@ def _parse_json_response(raw: str):
     return raw.strip()
 
 
+
 def extract_brand_guidelines(pdf_text: str, pdf_filepath: Optional[str] = None) -> dict:
     client = _get_client()
-
-    # Vision-based extraction: render pages and pass to Claude
-    if pdf_filepath:
-        from services.pdf_service import render_pdf_pages_as_images
-        pages = render_pdf_pages_as_images(pdf_filepath, max_pages=15)
-        if pages:
-            content: list = []
-            for b64, mime in pages:
-                content.append({'type': 'image', 'source': {'type': 'base64', 'media_type': mime, 'data': b64}})
-            content.append({
-                'type': 'text',
-                'text': (
-                    'These are pages from a pharma brand style guide. '
-                    'Extract ALL brand guidelines you can find across every page — personality traits, fonts, colors, tone, layout rules, required elements, prohibited elements, brand hallmark. '
-                    'Return only the JSON object.'
-                ),
-            })
-            try:
-                message = client.messages.create(
-                    model='claude-sonnet-4-6',
-                    max_tokens=2048,
-                    system=BRAND_GUIDELINES_SYSTEM_PROMPT,
-                    messages=[{'role': 'user', 'content': content}],
-                )
-                raw = _parse_json_response(message.content[0].text)
-                return json.loads(raw)
-            except Exception:
-                pass  # fall through to text-based
-
-    # Text-based fallback
     try:
         message = client.messages.create(
             model='claude-sonnet-4-6',
-            max_tokens=2048,
+            max_tokens=8192,
             system=BRAND_GUIDELINES_SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': f'Extract brand guidelines from this style guide:\n---\n{pdf_text}\n---\nReturn only the JSON object.'}],
         )

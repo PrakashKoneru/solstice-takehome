@@ -62,6 +62,9 @@ export type BrandGuidelines = {
   requiredElements?: string[]
   prohibited?: string[]
   hallmark?: string
+  supportedAudiences?: string[]
+  audienceRules?: Record<string, { rules: string[] }>
+  otherRelevantGuidelines?: Record<string, { rules: string[] }>
 }
 
 export type SlideTemplate = {
@@ -90,6 +93,7 @@ export type DesignSystemAsset = {
   asset_type: 'icon' | 'logo' | 'image'
   file_url: string
   filename: string
+  source: 'raster' | 'page_render'
   created_at: string
 }
 
@@ -180,6 +184,7 @@ export const api = {
       kbDocIds?: number[],
       mode: 'chat' | 'generate' | 'auto' = 'chat',
       currentDraft?: string | null,
+      targetAudience?: string,
     ) =>
       request<Message>(`/api/sessions/${sessionId}/messages`, {
         method: 'POST',
@@ -189,6 +194,7 @@ export const api = {
           kb_doc_ids: kbDocIds ?? [],
           mode,
           current_draft: currentDraft ?? null,
+          target_audience: targetAudience ?? null,
         }),
       }),
   },

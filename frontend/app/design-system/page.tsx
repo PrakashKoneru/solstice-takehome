@@ -202,6 +202,68 @@ function FlagPill({ children }: { children: React.ReactNode }) {
   )
 }
 
+const KNOWN_FIELDS = new Set([
+  'personality', 'tone', 'primaryFont', 'secondaryFont', 'fontUsageRule',
+  'colorHierarchy', 'layoutPrinciples', 'hallmark', 'requiredElements', 'prohibited',
+  'supportedAudiences',
+])
+
+function labelFromKey(key: string): string {
+  return key.replace(/([A-Z])/g, ' $1').replace(/^./, (s) => s.toUpperCase()).trim()
+}
+
+function DynamicSection({ title, value }: { title: string; value: unknown }) {
+  if (!value || (Array.isArray(value) && value.length === 0)) return null
+
+  // string[]
+  if (Array.isArray(value)) {
+    return (
+      <Section title={title}>
+        <div className="flex flex-wrap gap-2">
+          {(value as string[]).map((item) => <Pill key={item}>{item}</Pill>)}
+        </div>
+      </Section>
+    )
+  }
+
+  // Record<string, { rules: string[] }> — e.g. audienceRules, otherRelevantGuidelines
+  if (typeof value === 'object' && value !== null) {
+    const entries = Object.entries(value as Record<string, { rules?: string[] } | string>)
+    if (entries.length === 0) return null
+    return (
+      <Section title={title}>
+        <div className="space-y-4">
+          {entries.map(([subKey, subVal]) => (
+            <div key={subKey}>
+              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-2">{subKey}</p>
+              {typeof subVal === 'string' ? (
+                <p className="text-sm text-slate-700">{subVal}</p>
+              ) : Array.isArray((subVal as { rules?: string[] })?.rules) ? (
+                <div className="flex flex-wrap gap-2">
+                  {((subVal as { rules: string[] }).rules).map((rule, i) => (
+                    <Pill key={i}>{rule}</Pill>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          ))}
+        </div>
+      </Section>
+    )
+  }
+
+  // plain string
+  if (typeof value === 'string') {
+    return (
+      <Section title={title}>
+        <p className="text-sm text-slate-700">{value}</p>
+      </Section>
+    )
+  }
+
+  return null
+}
+
 function BrandTab({ guidelines, templates }: { guidelines: BrandGuidelines; templates: SlideTemplate[] }) {
   const hasGuidelines = guidelines && Object.values(guidelines).some((v) =>
     Array.isArray(v) ? v.length > 0 : Boolean(v)
@@ -215,6 +277,8 @@ function BrandTab({ guidelines, templates }: { guidelines: BrandGuidelines; temp
       </div>
     )
   }
+
+  const extraEntries = Object.entries(guidelines).filter(([k]) => !KNOWN_FIELDS.has(k))
 
   return (
     <div className="space-y-8">
@@ -289,6 +353,10 @@ function BrandTab({ guidelines, templates }: { guidelines: BrandGuidelines; temp
               </div>
             </Section>
           )}
+
+          {extraEntries.map(([key, value]) => (
+            <DynamicSection key={key} title={labelFromKey(key)} value={value} />
+          ))}
         </>
       )}
 
@@ -411,32 +479,54 @@ function AssetsTab({ dsId }: { dsId: number }) {
 
       {assets.length === 0 ? (
         <p className="text-center text-sm text-slate-400 py-6">No assets uploaded yet.</p>
-      ) : (
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
-          {assets.map((asset) => (
-            <div key={asset.id} className="group relative rounded-xl border border-slate-200 bg-white p-3 flex flex-col items-center gap-2">
-              <div className="h-16 w-16 rounded-lg bg-slate-100 flex items-center justify-center overflow-hidden">
-                {asset.filename.endsWith('.svg') ? (
-                  <img src={`http://localhost:5001/uploads/${asset.filename}`} alt={asset.name} className="h-12 w-12 object-contain" />
-                ) : (
-                  <img src={`http://localhost:5001/uploads/${asset.filename}`} alt={asset.name} className="h-full w-full object-cover rounded-lg" />
-                )}
-              </div>
-              <p className="text-xs font-medium text-slate-700 text-center truncate w-full">{asset.name}</p>
-              <span className="text-xs text-slate-400 capitalize">{asset.asset_type}</span>
-              <button
-                onClick={() => handleDeleteAsset(asset.id)}
-                className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-500 transition-all"
-                aria-label="Delete asset"
-              >
-                <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-                </svg>
-              </button>
+      ) : (() => {
+        const usable = assets.filter(a => a.source !== 'page_render')
+        const reference = assets.filter(a => a.source === 'page_render')
+        const AssetCard = ({ asset }: { asset: typeof assets[0] }) => (
+          <div key={asset.id} className="group relative rounded-xl border border-slate-200 bg-white p-3 flex flex-col items-center gap-2">
+            <div className="h-16 w-16 rounded-lg bg-slate-100 flex items-center justify-center overflow-hidden">
+              {asset.filename.endsWith('.svg') ? (
+                <img src={asset.file_url} alt={asset.name} className="h-12 w-12 object-contain" />
+              ) : (
+                <img src={asset.file_url} alt={asset.name} className="h-full w-full object-cover rounded-lg" />
+              )}
             </div>
-          ))}
-        </div>
-      )}
+            <p className="text-xs font-medium text-slate-700 text-center truncate w-full">{asset.name}</p>
+            <span className="text-xs text-slate-400 capitalize">{asset.asset_type}</span>
+            <button
+              onClick={() => handleDeleteAsset(asset.id)}
+              className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-500 transition-all"
+              aria-label="Delete asset"
+            >
+              <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        )
+        return (
+          <div className="space-y-6">
+            {usable.length > 0 && (
+              <div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                  {usable.map(asset => <AssetCard key={asset.id} asset={asset} />)}
+                </div>
+              </div>
+            )}
+            {reference.length > 0 && (
+              <div>
+                <div className="flex items-center gap-2 mb-3">
+                  <p className="text-sm font-medium text-slate-500">Captured from PDF</p>
+                  <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">These pages contain brand assets that couldn&apos;t be isolated — coming soon: crop &amp; edit</span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
+                  {reference.map(asset => <AssetCard key={asset.id} asset={asset} />)}
+                </div>
+              </div>
+            )}
+          </div>
+        )
+      })()}
     </div>
   )
 }
