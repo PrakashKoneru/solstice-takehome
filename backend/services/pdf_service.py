@@ -5,6 +5,18 @@ import cloudinary
 import cloudinary.uploader
 
 
+def extract_text_by_page(filepath: str) -> list:
+    """Return [{"page_number": 1, "text": "..."}, ...] for each page."""
+    try:
+        import fitz
+        doc = fitz.open(filepath)
+        return [{"page_number": i + 1, "text": page.get_text()} for i, page in enumerate(doc)]
+    except Exception:
+        from pypdf import PdfReader
+        reader = PdfReader(filepath)
+        return [{"page_number": i + 1, "text": page.extract_text() or ''} for i, page in enumerate(reader.pages)]
+
+
 def extract_text_from_pdf(filepath: str) -> str:
     try:
         import fitz

@@ -102,8 +102,24 @@ export type KnowledgeItem = {
   title: string
   filename: string
   doc_type: string
+  extraction_status?: 'pending' | 'extracting' | 'complete' | 'failed'
+  total_pages?: number | null
+  claim_count?: number
   created_at: string
   updated_at: string
+}
+
+export type Claim = {
+  id: string
+  knowledge_id: number
+  text: string
+  claim_type: string
+  source_citation: string | null
+  page_number: number | null
+  numeric_values: { value: string; unit?: string; label: string }[]
+  tags: string[]
+  is_approved: boolean
+  created_at: string
 }
 
 export type ReviewFlag = {
@@ -151,6 +167,17 @@ export const api = {
       return upload<KnowledgeItem>(`/api/knowledge/${id}`, fd, 'PATCH')
     },
     delete: (id: number)                                        => request<{ deleted: number }>(`/api/knowledge/${id}`, { method: 'DELETE' }),
+    listClaims: (id: number, params?: { claim_type?: string; is_approved?: boolean }) => {
+      const qs = new URLSearchParams()
+      if (params?.claim_type) qs.set('claim_type', params.claim_type)
+      if (params?.is_approved !== undefined) qs.set('is_approved', String(params.is_approved))
+      const q = qs.toString()
+      return request<Claim[]>(`/api/knowledge/${id}/claims${q ? '?' + q : ''}`)
+    },
+    updateClaim: (itemId: number, claimId: string, patch: Partial<Pick<Claim, 'text' | 'is_approved' | 'claim_type' | 'tags'>>) =>
+      request<Claim>(`/api/knowledge/${itemId}/claims/${claimId}`, { method: 'PATCH', body: JSON.stringify(patch) }),
+    deleteClaim: (itemId: number, claimId: string) =>
+      request<{ deleted: string }>(`/api/knowledge/${itemId}/claims/${claimId}`, { method: 'DELETE' }),
   },
   designSystem: {
     list: ()                  => request<DesignSystem[]>('/api/design-system/'),
@@ -172,11 +199,15 @@ export const api = {
   chat: {
     list: (sessionId: number) =>
       request<Message[]>(`/api/sessions/${sessionId}/messages`),
-    restore: (sessionId: number, htmlContent: string, reviewReport: ReviewReport | null) =>
+    restore: (sessionId: number, htmlContent: string, reviewReport: ReviewReport | null, originalPrompt?: string) =>
       request<Message>(`/api/sessions/${sessionId}/restore`, {
         method: 'POST',
-        body: JSON.stringify({ html_content: htmlContent, review_report: reviewReport }),
+        body: JSON.stringify({ html_content: htmlContent, review_report: reviewReport, original_prompt: originalPrompt ?? '' }),
       }),
+    export: (sessionId: number, msgId: number) =>
+      request<{ html_content: string; review_report: ReviewReport | null; prompt: string; generated_at: string }>(
+        `/api/sessions/${sessionId}/messages/${msgId}/export`
+      ),
     send: (
       sessionId: number,
       prompt: string,

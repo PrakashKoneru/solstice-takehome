@@ -1,8 +1,8 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import Sidebar from '@/components/Sidebar'
-import { api, KnowledgeItem, type Session } from '@/lib/api'
+import { api, KnowledgeItem, Claim, type Session } from '@/lib/api'
 
 const DOC_TYPES = [
   { value: 'claims', label: 'Approved Claims' },
@@ -21,6 +21,25 @@ function docTypeBadge(type: string) {
   return map[type] ?? map.general
 }
 
+const CLAIM_TYPE_LABELS: Record<string, string> = {
+  efficacy: 'Efficacy', safety: 'Safety', dosing: 'Dosing', moa: 'MOA',
+  isi: 'ISI', boilerplate: 'Boilerplate', stat: 'Stat',
+  study_design: 'Study Design', indication: 'Indication', nccn: 'NCCN',
+}
+
+const CLAIM_TYPE_COLORS: Record<string, string> = {
+  efficacy: 'bg-green-50 text-green-700',
+  safety: 'bg-red-50 text-red-700',
+  dosing: 'bg-blue-50 text-blue-700',
+  moa: 'bg-purple-50 text-purple-700',
+  isi: 'bg-orange-50 text-orange-700',
+  boilerplate: 'bg-slate-100 text-slate-600',
+  stat: 'bg-teal-50 text-teal-700',
+  study_design: 'bg-indigo-50 text-indigo-700',
+  indication: 'bg-amber-50 text-amber-700',
+  nccn: 'bg-sky-50 text-sky-700',
+}
+
 export default function KnowledgeBasePage() {
   const [files, setFiles] = useState<File[]>([])
   const [name, setName] = useState('')
@@ -37,10 +56,83 @@ export default function KnowledgeBasePage() {
   const [editLoading, setEditLoading] = useState(false)
   const [uploadError, setUploadError] = useState<string | null>(null)
 
+  // Claims panel state
+  const [claimsDocId, setClaimsDocId] = useState<number | null>(null)
+  const [claims, setClaims] = useState<Claim[]>([])
+  const [claimsLoading, setClaimsLoading] = useState(false)
+  const [claimsTypeFilter, setClaimsTypeFilter] = useState<string>('')
+  const [extractionProgress, setExtractionProgress] = useState<{ claims_so_far: number; total_pages: number } | null>(null)
+
   useEffect(() => {
     api.knowledge.list().then(setDocs).catch(console.error)
     api.sessions.list().then(setSessions).catch(console.error)
   }, [])
+
+  const loadClaims = useCallback(async (docId: number) => {
+    setClaimsLoading(true)
+    try {
+      const data = await api.knowledge.listClaims(docId)
+      setClaims(data)
+    } finally {
+      setClaimsLoading(false)
+    }
+  }, [])
+
+  const startExtractionStream = useCallback((docId: number) => {
+    const BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001'
+    const es = new EventSource(`${BASE}/api/knowledge/${docId}/extraction-stream`)
+    setClaimsDocId(docId)
+    setClaims([])
+    setExtractionProgress({ claims_so_far: 0, total_pages: 0 })
+
+    es.addEventListener('progress', (e) => {
+      const data = JSON.parse(e.data)
+      setExtractionProgress({ claims_so_far: data.claims_so_far, total_pages: data.total_pages })
+    })
+
+    es.addEventListener('claims', (e) => {
+      const newClaims: Claim[] = JSON.parse(e.data)
+      setClaims((prev) => {
+        const existingIds = new Set(prev.map((c) => c.id))
+        const unique = newClaims.filter((c) => !existingIds.has(c.id))
+        return [...prev, ...unique]
+      })
+    })
+
+    es.addEventListener('done', (e) => {
+      const data = JSON.parse(e.data)
+      es.close()
+      setExtractionProgress(null)
+      setDocs((prev) => prev.map((d) => d.id === docId
+        ? { ...d, extraction_status: data.status as KnowledgeItem['extraction_status'], claim_count: data.total_claims }
+        : d
+      ))
+    })
+
+    es.addEventListener('error', () => {
+      es.close()
+      setExtractionProgress(null)
+    })
+
+    return es
+  }, [])
+
+  async function toggleApproval(docId: number, claim: Claim) {
+    const updated = await api.knowledge.updateClaim(docId, claim.id, { is_approved: !claim.is_approved })
+    setClaims((prev) => prev.map((c) => (c.id === updated.id ? updated : c)))
+    // Update claim_count on the doc
+    setDocs((prev) => prev.map((d) => {
+      if (d.id !== docId) return d
+      const delta = updated.is_approved ? 1 : -1
+      return { ...d, claim_count: Math.max(0, (d.claim_count ?? 0) + delta) }
+    }))
+  }
+
+  async function handleDeleteClaim(docId: number, claimId: string) {
+    await api.knowledge.deleteClaim(docId, claimId)
+    setClaims((prev) => prev.filter((c) => c.id !== claimId))
+    setDocs((prev) => prev.map((d) => d.id === docId ? { ...d, claim_count: Math.max(0, (d.claim_count ?? 1) - 1) } : d))
+  }
 
   const isMulti = files.length > 1
 
@@ -67,6 +159,11 @@ export default function KnowledgeBasePage() {
       setFiles([])
       setName('')
       setDocType('general')
+      // Auto-open SSE stream for the first uploaded doc that is extracting
+      const extracting = uploaded.find((d) => d.extraction_status === 'extracting')
+      if (extracting) {
+        startExtractionStream(extracting.id)
+      }
     } catch (err: unknown) {
       setUploadError(err instanceof Error ? err.message : 'Upload failed')
     } finally {
@@ -278,6 +375,47 @@ export default function KnowledgeBasePage() {
                       <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ${docTypeBadge(doc.doc_type)}`}>
                         {DOC_TYPES.find((t) => t.value === doc.doc_type)?.label ?? doc.doc_type}
                       </span>
+                      {doc.extraction_status === 'extracting' && (
+                        <button
+                          onClick={() => {
+                            if (claimsDocId === doc.id) {
+                              setClaimsDocId(null)
+                              setExtractionProgress(null)
+                            } else {
+                              startExtractionStream(doc.id)
+                            }
+                          }}
+                          className="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-amber-50 text-amber-700 animate-pulse"
+                        >
+                          Extracting…
+                        </button>
+                      )}
+                      {doc.extraction_status === 'failed' && (
+                        <span className="inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium bg-red-50 text-red-700">
+                          Failed
+                        </span>
+                      )}
+                      {(doc.extraction_status === 'complete' || doc.extraction_status === 'pending' || !doc.extraction_status) && doc.claim_count !== undefined && (
+                        <button
+                          onClick={() => {
+                            if (claimsDocId === doc.id) {
+                              setClaimsDocId(null)
+                            } else {
+                              setClaimsDocId(doc.id)
+                              loadClaims(doc.id)
+                            }
+                          }}
+                          className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium transition-colors ${
+                            claimsDocId === doc.id
+                              ? 'bg-indigo-600 text-white'
+                              : doc.extraction_status === 'complete'
+                              ? 'bg-green-50 text-green-700 hover:bg-green-100'
+                              : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'
+                          }`}
+                        >
+                          {doc.claim_count} claim{doc.claim_count !== 1 ? 's' : ''}
+                        </button>
+                      )}
                       <button
                         onClick={() => startEdit(doc)}
                         className="text-slate-400 hover:text-indigo-500 transition-colors"
@@ -304,6 +442,101 @@ export default function KnowledgeBasePage() {
           </ul>
         )}
       </div>
+
+      {/* Claims panel */}
+      {claimsDocId !== null && (
+        <div className="rounded-xl border border-slate-200 bg-white shadow-sm overflow-hidden">
+          <div className="px-6 py-4 border-b border-slate-200 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-3">
+              <h2 className="text-sm font-semibold text-slate-700">
+                Claims — {docs.find((d) => d.id === claimsDocId)?.title}
+              </h2>
+              <span className="text-xs text-slate-400">{claims.length} total</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <select
+                value={claimsTypeFilter}
+                onChange={(e) => setClaimsTypeFilter(e.target.value)}
+                className="rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-700 focus:border-indigo-500 focus:outline-none"
+              >
+                <option value="">All types</option>
+                {Object.entries(CLAIM_TYPE_LABELS).map(([v, l]) => (
+                  <option key={v} value={v}>{l}</option>
+                ))}
+              </select>
+              <button
+                onClick={() => setClaimsDocId(null)}
+                className="text-slate-400 hover:text-slate-600 transition-colors text-xs"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+
+          {extractionProgress && claimsDocId !== null && (
+            <div className="px-6 py-3 bg-amber-50 border-b border-amber-100">
+              <div className="flex items-center justify-between text-xs text-amber-700 mb-1.5">
+                <span>Extracting claims…</span>
+                <span>{extractionProgress.claims_so_far} claims found</span>
+              </div>
+              <div className="w-full bg-amber-200 rounded-full h-1.5">
+                <div className="bg-amber-500 h-1.5 rounded-full transition-all duration-500 animate-pulse" style={{ width: '100%' }} />
+              </div>
+            </div>
+          )}
+
+          {claimsLoading ? (
+            <div className="py-12 text-center text-sm text-slate-400">Loading claims…</div>
+          ) : claims.length === 0 && !extractionProgress ? (
+            <div className="py-12 text-center text-sm text-slate-400">No claims extracted for this document.</div>
+          ) : (
+            <ul className="divide-y divide-slate-100 max-h-[600px] overflow-y-auto">
+              {claims
+                .filter((c) => !claimsTypeFilter || c.claim_type === claimsTypeFilter)
+                .map((claim) => (
+                  <li key={claim.id} className={`flex items-start gap-3 px-6 py-3 ${claim.is_approved ? '' : 'opacity-50'}`}>
+                    <button
+                      onClick={() => toggleApproval(claimsDocId, claim)}
+                      className={`mt-0.5 flex-shrink-0 w-5 h-5 rounded-full border-2 flex items-center justify-center transition-colors ${
+                        claim.is_approved
+                          ? 'border-green-500 bg-green-500 text-white'
+                          : 'border-slate-300 bg-white'
+                      }`}
+                      title={claim.is_approved ? 'Approved — click to reject' : 'Rejected — click to approve'}
+                    >
+                      {claim.is_approved && (
+                        <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                        </svg>
+                      )}
+                    </button>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-slate-800 leading-relaxed">{claim.text}</p>
+                      {claim.source_citation && (
+                        <p className="text-xs text-slate-400 mt-0.5">{claim.source_citation}</p>
+                      )}
+                    </div>
+                    <div className="flex items-center gap-2 flex-shrink-0">
+                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${CLAIM_TYPE_COLORS[claim.claim_type] ?? 'bg-slate-100 text-slate-600'}`}>
+                        {CLAIM_TYPE_LABELS[claim.claim_type] ?? claim.claim_type}
+                      </span>
+                      <button
+                        onClick={() => handleDeleteClaim(claimsDocId, claim.id)}
+                        className="text-slate-300 hover:text-red-400 transition-colors"
+                        title="Delete claim"
+                      >
+                        <svg className="h-3.5 w-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
+                    </div>
+                  </li>
+                ))}
+            </ul>
+          )}
+        </div>
+      )}
+
       </div>
       </div>
     </div>

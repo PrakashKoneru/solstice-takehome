@@ -54,18 +54,22 @@ class KnowledgeItem(db.Model):
     filename     = db.Column(db.String(255), nullable=False)
     file_path    = db.Column(db.String(500), nullable=False)
     text_content = db.Column(db.Text, nullable=True)
-    doc_type     = db.Column(db.String(50), nullable=False, default='general')
-    created_at   = db.Column(db.DateTime, default=datetime.utcnow)
-    updated_at   = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    doc_type           = db.Column(db.String(50), nullable=False, default='general')
+    extraction_status  = db.Column(db.String(20), default='pending')
+    total_pages        = db.Column(db.Integer, nullable=True)
+    created_at         = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at         = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     def to_dict(self):
         return {
-            'id':         self.id,
-            'title':      self.title,
-            'filename':   self.filename,
-            'doc_type':   self.doc_type,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat(),
+            'id':                self.id,
+            'title':             self.title,
+            'filename':          self.filename,
+            'doc_type':          self.doc_type,
+            'extraction_status': self.extraction_status,
+            'total_pages':       self.total_pages,
+            'created_at':        self.created_at.isoformat(),
+            'updated_at':        self.updated_at.isoformat(),
         }
 
 
@@ -121,4 +125,35 @@ class DesignSystemAsset(db.Model):
             'filename':         self.filename,
             'source':           self.source,
             'created_at':       self.created_at.isoformat(),
+        }
+
+
+class Claim(db.Model):
+    __tablename__ = 'claims'
+
+    id              = db.Column(db.String(64), primary_key=True)   # "{drug}_{type}_{study}_{seq}"
+    knowledge_id    = db.Column(db.Integer, db.ForeignKey('knowledge_items.id', ondelete='CASCADE'), nullable=False)
+    text            = db.Column(db.Text, nullable=False)           # verbatim, immutable after approval
+    claim_type      = db.Column(db.String(32), nullable=False)
+    # efficacy | safety | dosing | moa | isi | boilerplate | stat | study_design | indication | nccn
+    source_citation = db.Column(db.String(255), nullable=True)
+    page_number     = db.Column(db.Integer, nullable=True)
+    numeric_values  = db.Column(db.JSON, nullable=True)
+    # [{"value": "7.4", "unit": "months", "label": "median OS (FRUZAQLA)"}]
+    tags            = db.Column(db.JSON, nullable=True)
+    is_approved     = db.Column(db.Boolean, default=True, nullable=False)
+    created_at      = db.Column(db.DateTime, default=datetime.utcnow)
+
+    def to_dict(self):
+        return {
+            'id':              self.id,
+            'knowledge_id':    self.knowledge_id,
+            'text':            self.text,
+            'claim_type':      self.claim_type,
+            'source_citation': self.source_citation,
+            'page_number':     self.page_number,
+            'numeric_values':  self.numeric_values or [],
+            'tags':            self.tags or [],
+            'is_approved':     self.is_approved,
+            'created_at':      self.created_at.isoformat(),
         }
