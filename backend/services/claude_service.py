@@ -261,18 +261,17 @@ ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator for a pharma content st
 
 Available operations:
 - "generate"  — run the slide content agent (creates/edits/reorders slides)
-- "review"    — run the compliance review agent (always paired with generate when KB docs exist)
 - "chat"      — run the conversational agent (answers questions, guides the user, explains what was done)
 
 Rules:
-- If the user uses ANY word indicating slide creation or editing (create, build, generate, make, add, edit, update, reorder, move, fix, change) AND has_kb is true → return ["generate", "review"].
+- If the user uses ANY word indicating slide creation or editing (create, build, generate, make, add, edit, update, reorder, move, fix, change) AND has_kb is true → return ["generate"].
 - If the user is asking a question, planning, or exploring options (what, how, which, can you, tell me, show me, list) → return ["chat"].
 - If has_kb is false and the user wants to generate → return ["chat"] only.
 - When unsure → return ["chat"].
-- Never return ["generate", "review", "chat"] together — generation and chat are separate turns.
+- Never return ["generate", "chat"] together — generation and chat are separate turns.
 
 Respond with ONLY valid JSON — no explanation:
-{"ops": ["chat"]} or {"ops": ["generate", "review"]}"""
+{"ops": ["chat"]} or {"ops": ["generate"]}"""
 
 
 def orchestrate(prompt: str, history: list, has_kb: bool) -> list:

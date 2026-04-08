@@ -126,8 +126,8 @@ def send_message(session_id):
             # Content agent returned a plain-text explanation — treat as chat
             chat_text = raw
 
-    # ── Review agent (only when slides were produced) ─────────────────────────
-    if 'review' in ops and html_content and kb_texts:
+    # ── Review agent — always runs when slides are produced with KB context ──────
+    if html_content and kb_texts:
         review_report = review_content(html_content, kb_texts)
 
     # ── Chat agent ────────────────────────────────────────────────────────────
