@@ -5,6 +5,7 @@ import ReactMarkdown from 'react-markdown'
 import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
 import { api, type Session, type DesignSystem, type KnowledgeItem, type Message as ApiMessage, type ReviewReport } from '@/lib/api'
+import jsPDF from 'jspdf'
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string }
 type Version = { html: string; prompt: string; review: ReviewReport | null }
@@ -213,6 +214,31 @@ export default function SessionPage() {
     ro.observe(el)
     return () => ro.disconnect()
   }, [])
+
+  const [exporting, setExporting] = useState(false)
+
+  const exportPdf = async () => {
+    const slideEls = document.querySelectorAll('[data-slide]')
+    if (!slideEls.length) return
+    setExporting(true)
+    try {
+      const html2canvas = (await import('html2canvas')).default
+      const pdf = new jsPDF({ orientation: 'landscape', unit: 'px', format: [1024, 576] })
+      for (let i = 0; i < slideEls.length; i++) {
+        const canvas = await html2canvas(slideEls[i] as HTMLElement, {
+          scale: 2,
+          useCORS: true,
+          allowTaint: true,
+          backgroundColor: '#ffffff',
+        })
+        if (i > 0) pdf.addPage([1024, 576], 'landscape')
+        pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, 1024, 576)
+      }
+      pdf.save('slides.pdf')
+    } finally {
+      setExporting(false)
+    }
+  }
 
   const selectedDs = designSystems.find((d) => d.id === selectedDsId)
   const audienceOptions = selectedDs?.brand_guidelines?.supportedAudiences ?? []
@@ -781,6 +807,15 @@ export default function SessionPage() {
                 Preview
               </button>
             </div>
+            {currentHtml && (
+              <button
+                onClick={exportPdf}
+                disabled={exporting}
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-50"
+              >
+                {exporting ? 'Exporting…' : 'Export PDF'}
+              </button>
+            )}
             {viewMode === 'edit' && (
               <button
                 onClick={() => setViewMode('preview')}
