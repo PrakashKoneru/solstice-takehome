@@ -36,6 +36,7 @@ function parseSlides(html: string): string[] {
 const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }: { html: string; onSave: (updated: string) => void; paneH: number }) {
   const innerRef = useRef<HTMLDivElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
+  const [scaledH, setScaledH] = React.useState(paneH)
 
   useEffect(() => {
     const wrap = wrapRef.current
@@ -44,6 +45,7 @@ const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }:
     const apply = () => {
       const scale = Math.min(wrap.clientWidth / 1024, paneH / 576) * 0.92
       inner.style.transform = `scale(${scale})`
+      setScaledH(Math.round(576 * scale) + 24)
     }
     apply()
     const ro = new ResizeObserver(apply)
@@ -54,7 +56,7 @@ const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }:
   return (
     <div
       ref={wrapRef}
-      style={{ width: '100%', height: paneH, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
+      style={{ width: '100%', height: scaledH, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
     >
       <div
         ref={innerRef}
@@ -71,6 +73,7 @@ const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }:
 const SlidePreview = React.memo(function SlidePreview({ html, paneH }: { html: string; paneH: number }) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const innerRef = useRef<HTMLDivElement>(null)
+  const [scaledH, setScaledH] = React.useState(paneH)
 
   useEffect(() => {
     const wrap = wrapRef.current
@@ -79,6 +82,7 @@ const SlidePreview = React.memo(function SlidePreview({ html, paneH }: { html: s
     const apply = () => {
       const scale = Math.min(wrap.clientWidth / 1024, paneH / 576) * 0.92
       inner.style.transform = `scale(${scale})`
+      setScaledH(Math.round(576 * scale) + 24)
     }
     apply()
     const ro = new ResizeObserver(apply)
@@ -89,7 +93,7 @@ const SlidePreview = React.memo(function SlidePreview({ html, paneH }: { html: s
   return (
     <div
       ref={wrapRef}
-      style={{ width: '100%', height: paneH, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
+      style={{ width: '100%', height: scaledH, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
     >
       <div
         ref={innerRef}
