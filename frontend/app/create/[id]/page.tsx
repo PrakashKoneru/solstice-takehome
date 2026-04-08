@@ -218,22 +218,44 @@ export default function SessionPage() {
   const [exporting, setExporting] = useState(false)
 
   const exportPdf = async () => {
-    const slideEls = document.querySelectorAll('[data-slide]')
-    if (!slideEls.length) return
+    if (!currentHtml) return
     setExporting(true)
     try {
       const html2canvas = (await import('html2canvas')).default
       const pdf = new jsPDF({ orientation: 'landscape', unit: 'px', format: [1024, 576] })
+
+      // Parse slides from raw HTML — avoids any scale transforms in the preview
+      const parser = new DOMParser()
+      const doc = parser.parseFromString(currentHtml, 'text/html')
+      const slideEls = Array.from(doc.querySelectorAll('[data-slide]'))
+      if (!slideEls.length) return
+
+      // Off-screen container at exact slide dimensions, no transforms
+      const container = document.createElement('div')
+      container.style.cssText = 'position:fixed;left:-9999px;top:0;width:1024px;height:576px;overflow:hidden;'
+      document.body.appendChild(container)
+
       for (let i = 0; i < slideEls.length; i++) {
-        const canvas = await html2canvas(slideEls[i] as HTMLElement, {
+        container.innerHTML = slideEls[i].outerHTML
+        // Wait for images to load
+        await Promise.all(
+          Array.from(container.querySelectorAll('img')).map(
+            img => img.complete ? Promise.resolve() : new Promise(r => { img.onload = r; img.onerror = r })
+          )
+        )
+        const canvas = await html2canvas(container.firstElementChild as HTMLElement, {
           scale: 2,
           useCORS: true,
           allowTaint: true,
           backgroundColor: '#ffffff',
+          width: 1024,
+          height: 576,
         })
         if (i > 0) pdf.addPage([1024, 576], 'landscape')
         pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, 1024, 576)
       }
+
+      document.body.removeChild(container)
       pdf.save('slides.pdf')
     } finally {
       setExporting(false)
