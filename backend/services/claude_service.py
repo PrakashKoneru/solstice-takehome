@@ -615,7 +615,14 @@ REQUIRED ELEMENTS:
 
 EMPHASIS:
 - Use emphasis.numeric_value_index to visually highlight a specific number from the claim's numeric_values array.
-- Use hero_number style for the primary KPI on big_stat slides."""
+- Use hero_number style for the primary KPI on big_stat slides.
+
+EDITING AN EXISTING SPEC:
+When <current_spec> is provided, it is the current slide deck. The user's message describes a targeted change (swap a claim, change layout, add/remove a slide). Apply ONLY the requested change:
+- Keep every slide, claim reference, layout, and ordering that the user did NOT ask to change.
+- Only modify the specific element(s) the user mentioned.
+- Output the full deck spec with the minimal diff applied.
+- If <current_spec> is absent, generate from scratch as usual."""
 
 
 def _inject_enum(tool: dict, enum_values: list) -> dict:
@@ -750,6 +757,281 @@ def build_compliance_trace(spec: dict, claims_by_id: dict) -> dict:
     }
 
 
+RENDER_SPEC_SYSTEM_PROMPT = (
+    CONTENT_SYSTEM_PROMPT
+    + "\n\n"
+    + """RENDERING MODE — you are rendering a pre-approved slide spec:
+You receive a <slide_spec> containing the exact slide structure and resolved claim text. Your job is to render it as production-quality HTML using the full brand visual language.
+
+HARD RULES:
+- Do NOT change, rephrase, add to, or remove ANY factual text in the spec. Render every claim's text VERBATIM.
+- slide_title and cta_text may be rendered with creative typography but their wording is also fixed.
+- You MUST apply the brand's full visual language: gradients, decorative elements, icons, typography hierarchy, color treatments — everything that makes the brand come alive.
+- Follow the layout type specified for each slide but express it through the brand's design language, not a generic template."""
+)
+
+
+def render_spec_to_html(
+    spec: dict,
+    claims_by_id: dict,
+    design_tokens: Optional[dict] = None,
+    brand_guidelines: Optional[dict] = None,
+    slide_templates: Optional[list] = None,
+    ds_assets: Optional[list] = None,
+    current_html: Optional[str] = None,
+) -> str:
+    """
+    Send validated slide spec to Claude for rich HTML rendering.
+    Claims are resolved to verbatim text so Claude styles but cannot alter content.
+    """
+    client = _get_client()
+
+    # Resolve claim IDs to verbatim text inline
+    resolved = {"slides": []}
+    for slide in spec.get("slides", []):
+        s = {
+            "layout": slide.get("layout"),
+            "slide_title": slide.get("slide_title", ""),
+            "cta_text": slide.get("cta_text", ""),
+        }
+        h = slide.get("headline", {})
+        hid = h.get("claim_id")
+        s["headline"] = {
+            "text": claims_by_id[hid]["text"] if hid and hid in claims_by_id else "",
+            "emphasis": h.get("emphasis"),
+        }
+        s["body_claims"] = [
+            {
+                "text": claims_by_id[b["claim_id"]]["text"] if b.get("claim_id") and b["claim_id"] in claims_by_id else "",
+                "role": b.get("role", "supporting"),
+            }
+            for b in slide.get("body_claims", [])
+        ]
+        s["footer_claims"] = [
+            {
+                "text": claims_by_id[f["claim_id"]]["text"] if f.get("claim_id") and f["claim_id"] in claims_by_id else "",
+            }
+            for f in slide.get("footer_claims", [])
+        ]
+        resolved["slides"].append(s)
+
+    # Build context (same pattern as generate_content)
+    context_parts = []
+    if design_tokens:
+        context_parts.append(f"<design_tokens>\n{json.dumps(design_tokens, indent=2)}\n</design_tokens>")
+    if brand_guidelines:
+        context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
+    if slide_templates:
+        context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
+    if ds_assets:
+        embeddable = [a for a in ds_assets if a.get('source') != 'page_render']
+        if embeddable:
+            asset_list = [{'name': a['name'], 'type': a['asset_type'], 'url': a['file_url']} for a in embeddable]
+            context_parts.append(f"<brand_assets>\n{json.dumps(asset_list, indent=2)}\n</brand_assets>")
+
+    context_parts.append(f"<slide_spec>\n{json.dumps(resolved, indent=2)}\n</slide_spec>")
+
+    if current_html:
+        context_parts.append(f"<current_html>\n{current_html}\n</current_html>")
+        user_content = (
+            "\n\n".join(context_parts)
+            + "\n\nThe <current_html> is the existing rendered slide deck. The <slide_spec> contains updated content. "
+            "Find the text that changed between the current HTML and the new spec, and update ONLY that text in the HTML. "
+            "Preserve the EXACT same layout, styling, CSS, structure, icons, gradients, and decorative elements. "
+            "Output the complete HTML with only the changed text swapped in."
+        )
+    else:
+        user_content = "\n\n".join(context_parts) + "\n\nRender this slide spec as production HTML. Apply the brand's full visual language."
+
+    result_chunks = []
+    with client.beta.messages.stream(
+        model='claude-opus-4-6',
+        max_tokens=64000,
+        betas=['output-128k-2025-02-19'],
+        system=RENDER_SPEC_SYSTEM_PROMPT,
+        messages=[{'role': 'user', 'content': user_content}],
+    ) as stream:
+        for text in stream.text_stream:
+            result_chunks.append(text)
+    return ''.join(result_chunks).strip()
+
+
+EDIT_SPEC_TOOL = {
+    "name": "edit_slide_spec",
+    "description": "Apply targeted edits to an existing slide spec. Return only the changes.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "edits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "slide_index": {
+                            "type": "integer",
+                            "description": "0-based index of the slide to edit"
+                        },
+                        "action": {
+                            "type": "string",
+                            "enum": ["replace_headline", "replace_body_claim", "add_body_claim",
+                                     "remove_body_claim", "change_layout", "change_title"]
+                        },
+                        "body_claim_index": {
+                            "type": "integer",
+                            "description": "0-based index within body_claims (for replace/remove_body_claim)"
+                        },
+                        "new_claim_id": {
+                            "type": "string",
+                            "enum": [],
+                            "description": "The claim ID to use for replacement or addition"
+                        },
+                        "new_role": {
+                            "type": "string",
+                            "enum": ["supporting", "comparison", "context", "subgroup"]
+                        },
+                        "new_layout": {
+                            "type": "string",
+                            "enum": [
+                                "hero", "big_stat", "stat_row", "two_column",
+                                "three_column_cards", "comparison_table",
+                                "data_table", "subgroup_forest", "title_only"
+                            ]
+                        },
+                        "new_title": {
+                            "type": "string",
+                            "description": "New slide_title text (no numbers/percentages)"
+                        }
+                    },
+                    "required": ["slide_index", "action"]
+                }
+            }
+        },
+        "required": ["edits"]
+    }
+}
+
+EDIT_SPEC_SYSTEM_PROMPT = """You are a slide spec editor. You receive a <current_spec> (the existing slide deck) and a <claim_catalog> of available claims. The user describes a targeted change. Return ONLY the minimal edits needed.
+
+Actions:
+- replace_headline: swap the headline claim_id on a slide
+- replace_body_claim: swap a specific body_claim by index
+- add_body_claim: add a new claim to body_claims
+- remove_body_claim: remove a body_claim by index
+- change_layout: change a slide's layout type
+- change_title: change a slide's slide_title text
+
+Rules:
+- Only return edits for what the user asked to change. Do NOT re-specify unchanged slides.
+- Match the user's intent to the closest available claim in the catalog.
+- For replace actions, set new_claim_id to the best matching claim from the catalog."""
+
+
+def edit_slide_spec(
+    prompt: str,
+    current_spec: dict,
+    claims: list,
+    history: Optional[list] = None,
+) -> dict:
+    """
+    Apply targeted edits to an existing spec. Returns the modified spec.
+    Uses a lightweight tool call to determine edits, then applies them in Python.
+    """
+    client = _get_client()
+
+    claims_by_id = {c['id']: c for c in claims}
+    catalog = [
+        {"id": c['id'], "text": c['text'], "type": c['claim_type'], "tags": c.get('tags') or []}
+        for c in claims
+    ]
+
+    # Resolve current spec so the model sees actual text, not just IDs
+    resolved_spec = copy.deepcopy(current_spec)
+    for slide in resolved_spec.get('slides', []):
+        h = slide.get('headline', {})
+        hid = h.get('claim_id')
+        if hid and hid in claims_by_id:
+            h['text'] = claims_by_id[hid]['text']
+        for bc in slide.get('body_claims', []):
+            cid = bc.get('claim_id')
+            if cid and cid in claims_by_id:
+                bc['text'] = claims_by_id[cid]['text']
+        for fc in slide.get('footer_claims', []):
+            cid = fc.get('claim_id')
+            if cid and cid in claims_by_id:
+                fc['text'] = claims_by_id[cid]['text']
+
+    claim_id_enum = [c['id'] for c in catalog]
+    tool = copy.deepcopy(EDIT_SPEC_TOOL)
+    # Inject enum into new_claim_id
+    tool['input_schema']['properties']['edits']['items']['properties']['new_claim_id']['enum'] = claim_id_enum
+
+    user_content = (
+        f"<current_spec>\n{json.dumps(resolved_spec, indent=2)}\n</current_spec>\n\n"
+        f"<claim_catalog>\n{json.dumps(catalog, indent=2)}\n</claim_catalog>\n\n"
+        f"{prompt}"
+    )
+
+    messages = list(history or []) + [{'role': 'user', 'content': user_content}]
+
+    response = client.messages.create(
+        model='claude-sonnet-4-6',
+        max_tokens=2048,
+        system=EDIT_SPEC_SYSTEM_PROMPT,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "edit_slide_spec"},
+        messages=messages,
+    )
+
+    edits = None
+    for block in response.content:
+        if block.type == 'tool_use' and block.name == 'edit_slide_spec':
+            edits = block.input.get('edits', [])
+            break
+
+    if not edits:
+        raise ValueError("Model did not return edits")
+
+    print(f"[DEBUG] edit_slide_spec edits returned: {json.dumps(edits, indent=2)}")
+
+    # Apply edits to a copy of the spec
+    spec = copy.deepcopy(current_spec)
+    print(f"[DEBUG] prev spec before edits: {json.dumps(spec, indent=2)}")
+    slides = spec.get('slides', [])
+
+    for edit in edits:
+        idx = edit['slide_index']
+        if idx < 0 or idx >= len(slides):
+            continue
+        slide = slides[idx]
+        action = edit['action']
+
+        if action == 'replace_headline' and edit.get('new_claim_id'):
+            slide['headline'] = {'claim_id': edit['new_claim_id']}
+        elif action == 'replace_body_claim' and edit.get('body_claim_index') is not None:
+            bi = edit['body_claim_index']
+            if 0 <= bi < len(slide.get('body_claims', [])):
+                slide['body_claims'][bi] = {
+                    'claim_id': edit.get('new_claim_id', slide['body_claims'][bi].get('claim_id')),
+                    'role': edit.get('new_role', slide['body_claims'][bi].get('role', 'supporting')),
+                }
+        elif action == 'add_body_claim' and edit.get('new_claim_id'):
+            slide.setdefault('body_claims', []).append({
+                'claim_id': edit['new_claim_id'],
+                'role': edit.get('new_role', 'supporting'),
+            })
+        elif action == 'remove_body_claim' and edit.get('body_claim_index') is not None:
+            bi = edit['body_claim_index']
+            if 0 <= bi < len(slide.get('body_claims', [])):
+                slide['body_claims'].pop(bi)
+        elif action == 'change_layout' and edit.get('new_layout'):
+            slide['layout'] = edit['new_layout']
+        elif action == 'change_title' and edit.get('new_title'):
+            slide['slide_title'] = edit['new_title']
+
+    print(f"[DEBUG] spec after edits applied: {json.dumps(spec, indent=2)}")
+    return spec
+
+
 def generate_slide_spec(
     prompt: str,
     claims: list,
@@ -758,6 +1040,7 @@ def generate_slide_spec(
     target_audience: Optional[str] = None,
     audience_rules: Optional[dict] = None,
     history: Optional[list] = None,
+    current_spec: Optional[dict] = None,
 ) -> dict:
     """
     Generate a structured slide spec using approved claims as an enum constraint.
@@ -793,6 +1076,11 @@ def generate_slide_spec(
     if audience_rules and target_audience and target_audience in audience_rules:
         context_parts.append(
             f"<audience_rules>\n{json.dumps({target_audience: audience_rules[target_audience]}, indent=2)}\n</audience_rules>"
+        )
+
+    if current_spec:
+        context_parts.append(
+            f"<current_spec>\n{json.dumps(current_spec, indent=2)}\n</current_spec>"
         )
 
     user_content = (

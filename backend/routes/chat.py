@@ -5,6 +5,7 @@ from models import Message, ChatSession, DesignSystem, DesignSystemAsset, Knowle
 from services.claude_service import (
     generate_content, chat_response, review_content, orchestrate,
     generate_slide_spec, validate_slide_spec, build_compliance_trace,
+    render_spec_to_html, edit_slide_spec,
 )
 from services.renderer.renderer import render_deck
 
@@ -125,6 +126,16 @@ def send_message(session_id):
     review_report = None
     chat_text     = None
 
+    # Retrieve previous spec and HTML from last generation (if any)
+    prev_spec = None
+    prev_html = None
+    for m in reversed(prior_messages):
+        rr = m.review_report
+        if rr and isinstance(rr, dict) and 'spec' in rr:
+            prev_spec = rr['spec']
+            prev_html = m.html_content
+            break
+
     # ── Generation path (structured, claims-constrained) ──────────────────────
     if 'generate' in ops:
         if kb_doc_ids:
@@ -142,13 +153,24 @@ def send_message(session_id):
             else:
                 claims_by_id = {c['id']: c for c in claims_list}
                 try:
-                    spec = generate_slide_spec(
-                        prompt, claims_list, brand_guidelines, slide_templates,
-                        target_audience, audience_rules, slim_history,
-                    )
+                    if prev_spec:
+                        # Targeted edit path
+                        spec = edit_slide_spec(
+                            prompt, prev_spec, claims_list, slim_history,
+                        )
+                        spec_changed = (spec != prev_spec)
+                        print(f"[DEBUG] edit_slide_spec: spec_changed={spec_changed}")
+                    else:
+                        # Fresh generation path
+                        print(f"[DEBUG] Using generate_slide_spec path (no prev_spec)")
+                        spec = generate_slide_spec(
+                            prompt, claims_list, brand_guidelines, slide_templates,
+                            target_audience, audience_rules, slim_history,
+                        )
                     errors = validate_slide_spec(spec, list(claims_by_id.keys()), brand_guidelines)
                     if errors:
-                        # Retry once with errors as feedback
+                        print(f"[DEBUG] Validation errors after edit: {errors}")
+                        # Retry as fresh generation with errors as feedback
                         spec = generate_slide_spec(
                             prompt + f"\n\nFix these validation errors: {'; '.join(errors)}",
                             claims_list, brand_guidelines, slide_templates,
@@ -159,10 +181,52 @@ def send_message(session_id):
                     if errors:
                         chat_text = f"Could not generate compliant slides: {'; '.join(errors)}"
                     else:
-                        html_content = render_deck(
-                            spec, claims_by_id, design_tokens, brand_guidelines, ds_assets,
-                        )
+                        # Auto-inject most relevant ISI claim into clinical slides missing one
+                        isi_claims = {cid: c for cid, c in claims_by_id.items() if c.get('claim_type') == 'isi'}
+                        if isi_claims:
+                            clinical = {'big_stat', 'stat_row', 'two_column', 'three_column_cards',
+                                        'comparison_table', 'data_table', 'subgroup_forest'}
+                            for slide in spec.get('slides', []):
+                                if slide.get('layout') in clinical:
+                                    footer_ids = {fc.get('claim_id') for fc in slide.get('footer_claims', [])}
+                                    if not any(cid in footer_ids for cid in isi_claims):
+                                        # Collect tags from all claims referenced on this slide
+                                        slide_cids = []
+                                        h = slide.get('headline', {}).get('claim_id')
+                                        if h:
+                                            slide_cids.append(h)
+                                        slide_cids += [b['claim_id'] for b in slide.get('body_claims', []) if b.get('claim_id')]
+                                        slide_tags = set()
+                                        for cid in slide_cids:
+                                            slide_tags.update(t.lower() for t in (claims_by_id.get(cid, {}).get('tags') or []))
+
+                                        # Score each ISI by tag overlap with slide content
+                                        def isi_relevance(isi_id):
+                                            isi_tags = set(t.lower() for t in (isi_claims[isi_id].get('tags') or []))
+                                            return len(isi_tags & slide_tags)
+
+                                        best_isi = max(isi_claims.keys(), key=isi_relevance)
+                                        slide.setdefault('footer_claims', []).append({'claim_id': best_isi})
+
+                        # Render HTML — reuse previous if spec unchanged
+                        is_edit = prev_spec is not None
+                        if is_edit and spec == prev_spec and prev_html:
+                            print(f"[DEBUG] spec unchanged after edit, reusing previous HTML")
+                            html_content = prev_html
+                        else:
+                            try:
+                                html_content = render_spec_to_html(
+                                    spec, claims_by_id, design_tokens,
+                                    brand_guidelines, slide_templates, ds_assets,
+                                    current_html=prev_html if is_edit else None,
+                                )
+                            except Exception as e:
+                                print(f"[DEBUG] render_spec_to_html FAILED: {e}")
+                                html_content = render_deck(
+                                    spec, claims_by_id, design_tokens, brand_guidelines, ds_assets,
+                                )
                         review_report = build_compliance_trace(spec, claims_by_id)
+                        review_report['spec'] = spec
                         # Review Agent still runs as soft check
                         if kb_texts:
                             try:
