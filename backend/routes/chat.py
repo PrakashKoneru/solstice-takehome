@@ -74,19 +74,21 @@ def send_message(session_id):
     kb_doc_ids = data.get('kb_doc_ids') or []
     target_audience = data.get('target_audience') or None
 
-    design_tokens    = None
-    brand_guidelines = None
-    slide_templates  = None
-    ds_assets        = []
-    audience_rules   = None
-    ds               = None
+    design_tokens      = None
+    brand_guidelines   = None
+    slide_templates    = None
+    component_patterns = None
+    ds_assets          = []
+    audience_rules     = None
+    ds                 = None
     if ds_id:
         ds = DesignSystem.query.get(ds_id)
         if ds:
-            design_tokens    = ds.tokens
-            brand_guidelines = ds.brand_guidelines
-            slide_templates  = ds.slide_templates
-            audience_rules   = (ds.brand_guidelines or {}).get('audienceRules') if ds else None
+            design_tokens      = ds.tokens
+            brand_guidelines   = ds.brand_guidelines
+            slide_templates    = ds.slide_templates
+            component_patterns = ds.component_patterns
+            audience_rules     = (ds.brand_guidelines or {}).get('audienceRules') if ds else None
             raw_assets = DesignSystemAsset.query.filter_by(design_system_id=ds_id).all()
             ds_assets = [a.to_dict() for a in raw_assets]
 
@@ -219,6 +221,7 @@ def send_message(session_id):
                                     spec, claims_by_id, design_tokens,
                                     brand_guidelines, slide_templates, ds_assets,
                                     current_html=prev_html if is_edit else None,
+                                    component_patterns=component_patterns,
                                 )
                             except Exception as e:
                                 print(f"[DEBUG] render_spec_to_html FAILED: {e}")
@@ -248,6 +251,7 @@ def send_message(session_id):
             ds_assets=ds_assets,
             target_audience=target_audience,
             audience_rules=audience_rules,
+            component_patterns=component_patterns,
         )
 
     # ── Summary after generation ──────────────────────────────────────────────

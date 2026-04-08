@@ -35,7 +35,7 @@ def render_pdf_pages_as_images(filepath: str, max_pages: int = 30) -> list:
     except ImportError:
         return []
     doc = fitz.open(filepath)
-    mat = fitz.Matrix(1.0, 1.0)
+    mat = fitz.Matrix(1.5, 1.5)
     result = []
     for i, page in enumerate(doc):
         if i >= max_pages:

@@ -81,6 +81,7 @@ export type DesignSystem = {
   tokens: DesignTokens
   brand_guidelines: BrandGuidelines
   slide_templates: SlideTemplate[]
+  component_patterns: Record<string, any>
   is_default: boolean
   created_at: string
   updated_at: string

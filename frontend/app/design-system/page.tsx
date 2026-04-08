@@ -264,13 +264,14 @@ function DynamicSection({ title, value }: { title: string; value: unknown }) {
   return null
 }
 
-function BrandTab({ guidelines, templates }: { guidelines: BrandGuidelines; templates: SlideTemplate[] }) {
+function BrandTab({ guidelines, templates, componentPatterns }: { guidelines: BrandGuidelines; templates: SlideTemplate[]; componentPatterns: Record<string, any> }) {
   const hasGuidelines = guidelines && Object.values(guidelines).some((v) =>
     Array.isArray(v) ? v.length > 0 : Boolean(v)
   )
   const hasTemplates = templates && templates.length > 0
+  const hasPatterns = componentPatterns && Object.keys(componentPatterns).length > 0
 
-  if (!hasGuidelines && !hasTemplates) {
+  if (!hasGuidelines && !hasTemplates && !hasPatterns) {
     return (
       <div className="flex flex-col items-center justify-center h-40 text-slate-400 text-sm">
         No brand guidelines extracted. Try re-uploading your style guide.
@@ -383,6 +384,80 @@ function BrandTab({ guidelines, templates }: { guidelines: BrandGuidelines; temp
             ))}
           </div>
         </Section>
+      )}
+
+      {hasPatterns && (
+        <>
+          {componentPatterns.patterns && Object.keys(componentPatterns.patterns).length > 0 && (
+            <Section title={`Component Patterns (${Object.keys(componentPatterns.patterns).length})`}>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {Object.entries(componentPatterns.patterns).map(([name, pattern]: [string, any]) => (
+                  <div key={name} className="rounded-xl border border-slate-200 bg-white p-4 space-y-1.5">
+                    <p className="text-sm font-semibold text-slate-800">{name}</p>
+                    {pattern.description && <p className="text-xs text-slate-500">{pattern.description}</p>}
+                  </div>
+                ))}
+              </div>
+            </Section>
+          )}
+
+          {componentPatterns.slideLayouts?.length > 0 && (
+            <Section title={`Slide Layouts (${componentPatterns.slideLayouts.length})`}>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                {componentPatterns.slideLayouts.map((layout: any, i: number) => (
+                  <div key={i} className="rounded-xl border border-slate-200 bg-white p-4 space-y-1.5">
+                    <p className="text-sm font-semibold text-slate-800">{layout.name}</p>
+                    {layout.description && <p className="text-xs text-slate-500">{layout.description}</p>}
+                    {layout.structure && (
+                      <p className="text-xs text-slate-400 italic">{layout.structure}</p>
+                    )}
+                    {layout.components?.length > 0 && (
+                      <div className="flex flex-wrap gap-1 mt-1">
+                        {layout.components.map((c: string, j: number) => (
+                          <span key={j} className="text-[10px] bg-slate-100 text-slate-600 px-1.5 py-0.5 rounded">{c}</span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                ))}
+              </div>
+            </Section>
+          )}
+
+          {componentPatterns.colorSystem?.colors?.length > 0 && (
+            <Section title="Color System">
+              <div className="flex flex-wrap gap-3">
+                {componentPatterns.colorSystem.colors.map((color: any, i: number) => (
+                  <div key={i} className="flex items-center gap-2">
+                    <div
+                      className="w-8 h-8 rounded-lg border border-slate-200 flex-shrink-0"
+                      style={{ backgroundColor: color.hex }}
+                    />
+                    <div>
+                      <p className="text-xs font-medium text-slate-700">{color.name || color.hex}</p>
+                      {color.role && <p className="text-[10px] text-slate-400">{color.role}</p>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </Section>
+          )}
+
+          {componentPatterns.typographySystem?.contextualRules?.length > 0 && (
+            <Section title="Contextual Typography Rules">
+              <div className="space-y-2">
+                {componentPatterns.typographySystem.contextualRules.map((rule: any, i: number) => (
+                  <div key={i} className="flex gap-2 text-xs">
+                    <span className="text-slate-500 w-32 flex-shrink-0 font-medium">{rule.context}</span>
+                    <span className="text-slate-700">
+                      {[rule.fontFamily, rule.weight, rule.size, rule.color, rule.case].filter(Boolean).join(' / ')}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </Section>
+          )}
+        </>
       )}
     </div>
   )
@@ -720,7 +795,7 @@ export default function DesignSystemPage() {
                 {tab === 'tokens' ? (
                   <TokensTab tokens={selected.tokens} />
                 ) : tab === 'brand' ? (
-                  <BrandTab guidelines={selected.brand_guidelines ?? {}} templates={selected.slide_templates ?? []} />
+                  <BrandTab guidelines={selected.brand_guidelines ?? {}} templates={selected.slide_templates ?? []} componentPatterns={selected.component_patterns ?? {}} />
                 ) : (
                   <AssetsTab dsId={selected.id} />
                 )}

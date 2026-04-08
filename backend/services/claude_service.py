@@ -143,6 +143,71 @@ Return ONLY a valid JSON array matching this schema:
 Examples of good templates: 3-column data cards, 2-column comparison, key stat + supporting cards, full-width data table, efficacy summary with hero number."""
 
 
+COMPONENT_PATTERNS_SYSTEM_PROMPT = """You are a design system analyst. You will receive rendered pages from a design system / style guide document as images.
+
+Your job: identify every distinct visual pattern, component, rule, and styling specification this document defines. Extract each one into a structured JSON description that another AI can consume to produce pixel-accurate HTML/CSS output matching this brand.
+
+APPROACH:
+1. Look at every page. Determine what the document is trying to teach you — what visual rules is it establishing?
+2. For each distinct pattern you identify, give it a descriptive name and extract every visual property you can see.
+3. Describe visual properties in whatever terms are most precise for faithful reproduction. Use CSS-compatible syntax where applicable (hex colors, px/rem values, font-family names, border shorthand, linear-gradient() syntax, box-shadow syntax, border-radius values — including but not limited to these) but use plain geometric or spatial descriptions when CSS cannot capture the property (e.g. arc sweep angles, shape relationships, layering order, proportional sizing, animation behavior).
+4. Be precise: "2px solid #8C4799" not "thin purple border". "#002855" not "dark blue". "arc sweeping 180deg from top-left, stroke 2px #8C4799, no fill" not "purple curved line". NEVER use color names like "light blue", "dark blue", "purple" — ALWAYS resolve to the exact hex value from the document's color palette. If the document defines light blue as #59CBE8, every reference to that color must use #59CBE8.
+5. When a page shows annotated examples (arrows or lines pointing to elements with descriptions), extract both the visual property AND the rule being taught.
+6. When a page shows multiple variants of the same element (e.g. logo on white vs dark background, hover states, responsive versions), capture all variants.
+7. When a page shows a complete layout example (a full slide or page mockup), decompose it into its constituent patterns — header, body regions, footer — and describe how they're assembled.
+8. Extract what you SEE. Do not invent, assume, or generalize beyond what the document shows.
+
+OUTPUT FORMAT:
+Return ONLY a valid JSON object with this structure:
+
+{
+  "patterns": {
+    "<descriptive_name>": {
+      "description": "What this pattern is and when to use it",
+      "properties": {
+        // Visual properties that define this pattern
+        // Nest as deeply as needed to capture the full specification
+        // Use CSS values where possible, plain descriptions otherwise
+      },
+      "variants": [],
+      "rules": []
+    }
+  },
+  "slideLayouts": [
+    {
+      "name": "",
+      "description": "What this layout looks like and what content it's designed for",
+      "structure": "Describe the spatial arrangement: regions, columns, proportions, spacing",
+      "components": ["which patterns from above are used in this layout"]
+    }
+  ],
+  "colorSystem": {
+    "colors": [
+      { "hex": "", "name": "", "role": "", "usage": "" }
+    ],
+    "hierarchy": "",
+    "gradients": [],
+    "tintShadeRules": ""
+  },
+  "typographySystem": {
+    "fonts": [
+      { "family": "", "role": "", "weights": [], "usage": "" }
+    ],
+    "contextualRules": [
+      { "context": "", "fontFamily": "", "weight": "", "color": "", "case": "", "size": "" }
+    ]
+  }
+}
+
+The "patterns" object should contain AS MANY entries as the document defines. Do NOT force categories — only extract what the document actually defines. If the document defines 20 distinct patterns, return 20. If it defines 5, return 5.
+
+For "slideLayouts": identify every DISTINCT page/slide layout shown in the document. Two pages with different spatial arrangements are different layouts even if they share some components. A data table page, a chart page, a three-column card page, and a hero stat page are all separate layouts. Extract at minimum every layout the document explicitly demonstrates.
+
+For all gradient and color properties: express gradients as CSS linear-gradient() or radial-gradient() syntax using exact hex values. For example: "linear-gradient(to bottom, #59CBE8, #FFFFFF)" not "light blue to white".
+
+"colorSystem" and "typographySystem" are separated because they are cross-cutting — they apply across all patterns. Extract the FULL color palette with roles and hierarchy, and the FULL typography system with contextual rules that specify how styling varies by content role."""
+
+
 CONTENT_SYSTEM_PROMPT = """You are a pharma slide generation assistant producing professional branded slides for the intended audience.
 
 OUTPUT FORMAT — non-negotiable:
@@ -204,6 +269,15 @@ POSITIONING — non-negotiable:
 DESIGN TOKENS — use exact values, no approximations:
 - Apply all values from <design_tokens> to their corresponding elements.
 - Hex colors, font families, sizes, weights, line heights — use exactly as specified.
+
+COMPONENT PATTERNS — visual source of truth (highest priority):
+When <component_patterns> is present, it contains the brand's complete visual specification extracted from their style guide via vision analysis. It overrides <design_tokens> and <slide_templates> for all visual decisions.
+- "patterns": every named visual component the brand defines. Before building any element (header, footer, chart, table, card, icon, callout), check if a matching pattern exists. If it does, apply its properties exactly.
+- "colorSystem": the full palette with roles and hierarchy. Use the right color for the right context — drug data in the drug color, placebo in the placebo color, headlines in the headline color. Use gradients exactly as specified in CSS syntax.
+- "typographySystem.contextualRules": font styling varies by content role, not just heading level. Apply the exact font, weight, color, and case for each context (headlines, chart heads, body copy, drug data, placebo data, bullet points, etc).
+- "slideLayouts": available layout patterns with their spatial structure and component references. Use the closest matching layout for the content type.
+- If a pattern has "rules", those are hard constraints from the brand — follow them literally.
+- If a pattern has "variants", select the appropriate variant for the context.
 
 BRAND ASSETS:
 - <brand_assets> lists available brand icons and logos with their Cloudinary URLs.
@@ -302,6 +376,7 @@ def chat_response(
     ds_assets: Optional[list] = None,
     target_audience: Optional[str] = None,
     audience_rules: Optional[dict] = None,
+    component_patterns: Optional[dict] = None,
 ) -> str:
     client = _get_client()
     context_parts = []
@@ -309,6 +384,8 @@ def chat_response(
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
     if slide_templates:
         context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
+    if component_patterns:
+        context_parts.append(f"<component_patterns>\n{json.dumps(component_patterns, indent=2)}\n</component_patterns>")
     if ds_assets:
         asset_list = [{'name': a['name'], 'type': a['asset_type']} for a in ds_assets]
         context_parts.append(f"<brand_assets>\n{json.dumps(asset_list, indent=2)}\n</brand_assets>")
@@ -341,6 +418,7 @@ def generate_content(
     history: Optional[list] = None,
     target_audience: Optional[str] = None,
     audience_rules: Optional[dict] = None,
+    component_patterns: Optional[dict] = None,
 ) -> str:
     client = _get_client()
 
@@ -351,6 +429,8 @@ def generate_content(
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
     if slide_templates:
         context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
+    if component_patterns:
+        context_parts.append(f"<component_patterns>\n{json.dumps(component_patterns, indent=2)}\n</component_patterns>")
     if ds_assets:
         embeddable = [a for a in ds_assets if a.get('source') != 'page_render']
         if embeddable:
@@ -504,6 +584,75 @@ def extract_slide_templates(pdf_text: str, pdf_filepath: Optional[str] = None) -
         return json.loads(raw)
     except Exception:
         return []
+
+
+def extract_component_patterns(pdf_filepath: str, pdf_text: str = "") -> dict:
+    """
+    Vision-based extraction of component patterns from a style guide PDF.
+    Sends rendered pages as images to Claude Vision for structural analysis.
+    Falls back to text-based extraction if vision fails.
+    """
+    client = _get_client()
+
+    from services.pdf_service import render_pdf_pages_as_images
+    pages = render_pdf_pages_as_images(pdf_filepath, max_pages=25)
+
+    if not pages:
+        return _extract_component_patterns_fallback(client, pdf_text)
+
+    content = []
+    for i, (b64, mime) in enumerate(pages):
+        content.append({'type': 'text', 'text': f'Page {i + 1}:'})
+        content.append({
+            'type': 'image',
+            'source': {'type': 'base64', 'media_type': mime, 'data': b64},
+        })
+
+    content.append({
+        'type': 'text',
+        'text': (
+            'These are all pages from a design system / style guide document. '
+            'Extract every reusable visual component pattern you can identify. '
+            'Pay special attention to annotated examples where the document is teaching specific visual rules. '
+            'Use exact CSS-compatible values for every property you can identify. '
+            'For properties that CSS cannot express, use precise geometric or spatial descriptions.'
+        ),
+    })
+
+    # Also send text for context (annotations reference visual elements)
+    if pdf_text:
+        content.append({
+            'type': 'text',
+            'text': f'\n\nFor reference, here is the extracted text from the same PDF:\n\n{pdf_text[:6000]}',
+        })
+
+    try:
+        message = client.messages.create(
+            model='claude-sonnet-4-20250514',
+            max_tokens=16384,
+            system=COMPONENT_PATTERNS_SYSTEM_PROMPT,
+            messages=[{'role': 'user', 'content': content}],
+        )
+        raw = _parse_json_response(message.content[0].text)
+        return json.loads(raw)
+    except Exception as e:
+        print(f"[WARN] Vision-based component extraction failed: {e}")
+        return _extract_component_patterns_fallback(client, pdf_text)
+
+
+def _extract_component_patterns_fallback(client, pdf_text: str) -> dict:
+    """Text-only fallback when vision extraction fails."""
+    try:
+        message = client.messages.create(
+            model='claude-sonnet-4-20250514',
+            max_tokens=16384,
+            system=COMPONENT_PATTERNS_SYSTEM_PROMPT,
+            messages=[{'role': 'user', 'content': f'Extract component patterns from this style guide text:\n---\n{pdf_text}\n---'}],
+        )
+        raw = _parse_json_response(message.content[0].text)
+        return json.loads(raw)
+    except Exception:
+        return {"patterns": {}, "slideLayouts": [], "colorSystem": {}, "typographySystem": {}}
 
 
 # ── Structured generation (claims-constrained) ────────────────────────────────
@@ -779,6 +928,7 @@ def render_spec_to_html(
     slide_templates: Optional[list] = None,
     ds_assets: Optional[list] = None,
     current_html: Optional[str] = None,
+    component_patterns: Optional[dict] = None,
 ) -> str:
     """
     Send validated slide spec to Claude for rich HTML rendering.
@@ -823,6 +973,8 @@ def render_spec_to_html(
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
     if slide_templates:
         context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
+    if component_patterns:
+        context_parts.append(f"<component_patterns>\n{json.dumps(component_patterns, indent=2)}\n</component_patterns>")
     if ds_assets:
         embeddable = [a for a in ds_assets if a.get('source') != 'page_render']
         if embeddable:

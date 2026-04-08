@@ -82,8 +82,9 @@ class DesignSystem(db.Model):
     pdf_filename = db.Column(db.String(255), nullable=True)
     tokens            = db.Column(db.JSON, nullable=True)
     brand_guidelines  = db.Column(db.JSON, nullable=True)
-    slide_templates   = db.Column(db.JSON, nullable=True)
-    is_default        = db.Column(db.Boolean, default=False, nullable=False)
+    slide_templates    = db.Column(db.JSON, nullable=True)
+    component_patterns = db.Column(db.JSON, nullable=True)
+    is_default         = db.Column(db.Boolean, default=False, nullable=False)
     created_at   = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at   = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -96,8 +97,9 @@ class DesignSystem(db.Model):
             'pdf_filename': self.pdf_filename,
             'tokens':           self.tokens or {},
             'brand_guidelines': self.brand_guidelines or {},
-            'slide_templates':  self.slide_templates or [],
-            'is_default':       self.is_default,
+            'slide_templates':    self.slide_templates or [],
+            'component_patterns': self.component_patterns or {},
+            'is_default':         self.is_default,
             'created_at':   self.created_at.isoformat(),
             'updated_at':   self.updated_at.isoformat(),
         }

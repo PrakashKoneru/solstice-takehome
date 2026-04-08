@@ -6,7 +6,7 @@ from werkzeug.utils import secure_filename
 from extensions import db
 from models import DesignSystem, DesignSystemAsset
 from services.pdf_service import extract_text_from_pdf, extract_assets_from_pdf
-from services.claude_service import extract_design_tokens, extract_brand_guidelines, extract_slide_templates
+from services.claude_service import extract_design_tokens, extract_brand_guidelines, extract_slide_templates, extract_component_patterns
 
 design_system_bp = Blueprint('design_system', __name__, url_prefix='/api/design-system')
 
@@ -44,7 +44,8 @@ def upload_design_system():
     pdf_text = extract_text_from_pdf(filepath)
     tokens           = extract_design_tokens(pdf_text)
     brand_guidelines = extract_brand_guidelines(pdf_text, pdf_filepath=filepath)
-    slide_templates  = extract_slide_templates(pdf_text, pdf_filepath=filepath)
+    slide_templates    = extract_slide_templates(pdf_text, pdf_filepath=filepath)
+    component_patterns = extract_component_patterns(filepath, pdf_text)
 
     no_default_exists = not db.session.query(DesignSystem.id).filter_by(is_default=True).scalar()
     ds = DesignSystem(
@@ -53,6 +54,7 @@ def upload_design_system():
         tokens=tokens,
         brand_guidelines=brand_guidelines,
         slide_templates=slide_templates,
+        component_patterns=component_patterns,
         is_default=no_default_exists,
     )
     db.session.add(ds)
