@@ -264,7 +264,7 @@ Available operations:
 - "chat"      — run the conversational agent (answers questions, guides the user, explains what was done)
 
 Rules:
-- If the user uses ANY word indicating slide creation or editing (create, build, generate, make, add, edit, update, reorder, move, fix, change) AND has_kb is true → return ["generate"].
+- If the user uses ANY word indicating slide creation, editing, or removal (create, build, generate, make, add, edit, update, reorder, move, fix, change, delete, remove, drop) AND has_kb is true → return ["generate"].
 - If the user is asking a question, planning, or exploring options (what, how, which, can you, tell me, show me, list) → return ["chat"].
 - If has_kb is false and the user wants to generate → return ["chat"] only.
 - When unsure → return ["chat"].
@@ -370,9 +370,10 @@ def generate_content(
 
     messages = list(history or []) + [{'role': 'user', 'content': user_content}]
 
-    message = client.messages.create(
+    message = client.beta.messages.create(
         model='claude-sonnet-4-6',
-        max_tokens=8192,
+        max_tokens=16000,
+        betas=['output-128k-2025-02-19'],
         system=CONTENT_SYSTEM_PROMPT,
         messages=messages,
     )
