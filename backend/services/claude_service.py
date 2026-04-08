@@ -372,7 +372,7 @@ def generate_content(
 
     message = client.beta.messages.create(
         model='claude-sonnet-4-6',
-        max_tokens=16000,
+        max_tokens=64000,
         betas=['output-128k-2025-02-19'],
         system=CONTENT_SYSTEM_PROMPT,
         messages=messages,
