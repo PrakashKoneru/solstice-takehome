@@ -280,7 +280,7 @@ def orchestrate(prompt: str, history: list, has_kb: bool) -> list:
     try:
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001',
-            max_tokens=40,
+            max_tokens=256,
             system=ORCHESTRATOR_SYSTEM_PROMPT,
             messages=history + [{'role': 'user', 'content': f'has_kb: {str(has_kb).lower()}\n\nUser message: {prompt}'}],
         )
@@ -321,7 +321,7 @@ def chat_response(
     messages = list(history or []) + [{'role': 'user', 'content': user_content}]
     message = client.messages.create(
         model='claude-sonnet-4-6',
-        max_tokens=512,
+        max_tokens=8192,
         system=CHAT_SYSTEM_PROMPT,
         messages=messages,
     )
@@ -414,7 +414,7 @@ def review_content(html: str, kb_texts: list) -> dict:
     try:
         message = client.messages.create(
             model='claude-sonnet-4-6',
-            max_tokens=1024,
+            max_tokens=8192,
             system=REVIEW_SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': user_content}],
         )
@@ -480,7 +480,7 @@ def extract_slide_templates(pdf_text: str, pdf_filepath: Optional[str] = None) -
             try:
                 message = client.messages.create(
                     model='claude-sonnet-4-6',
-                    max_tokens=2048,
+                    max_tokens=8192,
                     system=SLIDE_TEMPLATES_SYSTEM_PROMPT,
                     messages=[{'role': 'user', 'content': content}],
                 )
@@ -493,7 +493,7 @@ def extract_slide_templates(pdf_text: str, pdf_filepath: Optional[str] = None) -
     try:
         message = client.messages.create(
             model='claude-sonnet-4-6',
-            max_tokens=2048,
+            max_tokens=8192,
             system=SLIDE_TEMPLATES_SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': f'Based on this style guide, define recommended slide templates:\n---\n{pdf_text}\n---\nReturn only the JSON array.'}],
         )
@@ -507,7 +507,7 @@ def extract_design_tokens(pdf_text: str) -> dict:
     client = _get_client()
     message = client.messages.create(
         model='claude-sonnet-4-6',
-        max_tokens=2048,
+        max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=[{
             'role': 'user',
