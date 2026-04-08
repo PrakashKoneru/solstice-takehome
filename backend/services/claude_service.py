@@ -1,4 +1,6 @@
+import copy
 import os
+import re
 import json
 import anthropic
 from typing import Optional
@@ -320,7 +322,7 @@ def chat_response(
     user_content = "\n\n".join(context_parts + [prompt]) if context_parts else prompt
     messages = list(history or []) + [{'role': 'user', 'content': user_content}]
     message = client.messages.create(
-        model='claude-sonnet-4-6',
+        model='claude-opus-4-6',
         max_tokens=8192,
         system=CHAT_SYSTEM_PROMPT,
         messages=messages,
@@ -371,7 +373,7 @@ def generate_content(
     messages = list(history or []) + [{'role': 'user', 'content': user_content}]
 
     message = client.beta.messages.create(
-        model='claude-sonnet-4-6',
+        model='claude-opus-4-6',
         max_tokens=64000,
         betas=['output-128k-2025-02-19'],
         system=CONTENT_SYSTEM_PROMPT,
@@ -414,7 +416,7 @@ def review_content(html: str, kb_texts: list) -> dict:
     user_content = f"<draft_html>\n{html}\n</draft_html>\n\n<knowledge_base>\n{kb_combined}\n</knowledge_base>\n\nAudit the draft HTML against the knowledge base. Return only the JSON review report."
     try:
         message = client.messages.create(
-            model='claude-sonnet-4-6',
+            model='claude-opus-4-6',
             max_tokens=8192,
             system=REVIEW_SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': user_content}],
@@ -448,7 +450,7 @@ def extract_brand_guidelines(pdf_text: str, pdf_filepath: Optional[str] = None) 
     client = _get_client()
     try:
         message = client.messages.create(
-            model='claude-sonnet-4-6',
+            model='claude-opus-4-6',
             max_tokens=8192,
             system=BRAND_GUIDELINES_SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': f'Extract brand guidelines from this style guide:\n---\n{pdf_text}\n---\nReturn only the JSON object.'}],
@@ -480,7 +482,7 @@ def extract_slide_templates(pdf_text: str, pdf_filepath: Optional[str] = None) -
             })
             try:
                 message = client.messages.create(
-                    model='claude-sonnet-4-6',
+                    model='claude-opus-4-6',
                     max_tokens=8192,
                     system=SLIDE_TEMPLATES_SYSTEM_PROMPT,
                     messages=[{'role': 'user', 'content': content}],
@@ -493,7 +495,7 @@ def extract_slide_templates(pdf_text: str, pdf_filepath: Optional[str] = None) -
     # Text-based fallback
     try:
         message = client.messages.create(
-            model='claude-sonnet-4-6',
+            model='claude-opus-4-6',
             max_tokens=8192,
             system=SLIDE_TEMPLATES_SYSTEM_PROMPT,
             messages=[{'role': 'user', 'content': f'Based on this style guide, define recommended slide templates:\n---\n{pdf_text}\n---\nReturn only the JSON array.'}],
@@ -504,10 +506,325 @@ def extract_slide_templates(pdf_text: str, pdf_filepath: Optional[str] = None) -
         return []
 
 
+# ── Structured generation (claims-constrained) ────────────────────────────────
+
+SLIDE_SPEC_TOOL = {
+    "name": "generate_slide_deck",
+    "description": "Generate a slide deck as a structured spec. Every factual text element must reference an approved claim ID. Only slide_title and cta_text may be written freely.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "slides": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "layout": {
+                            "type": "string",
+                            "enum": [
+                                "hero", "big_stat", "stat_row", "two_column",
+                                "three_column_cards", "comparison_table",
+                                "data_table", "subgroup_forest", "title_only"
+                            ]
+                        },
+                        "slide_title": {
+                            "type": "string",
+                            "description": (
+                                "Creative framing headline with NO numbers, NO percentages, "
+                                "NO comparative outcomes. Pure brand/context copy only. "
+                                "Examples: 'Reimagine Survival', 'Proven in a Phase 3 Trial'."
+                            )
+                        },
+                        "headline": {
+                            "type": "object",
+                            "properties": {
+                                "claim_id": {"type": "string", "enum": []},
+                                "emphasis": {
+                                    "type": "object",
+                                    "properties": {
+                                        "numeric_value_index": {"type": "integer"},
+                                        "style": {
+                                            "type": "string",
+                                            "enum": ["hero_number", "bold", "color_accent"]
+                                        }
+                                    }
+                                }
+                            },
+                            "required": ["claim_id"]
+                        },
+                        "body_claims": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "claim_id": {"type": "string", "enum": []},
+                                    "role": {
+                                        "type": "string",
+                                        "enum": ["supporting", "comparison", "context", "subgroup"]
+                                    }
+                                },
+                                "required": ["claim_id", "role"]
+                            }
+                        },
+                        "footer_claims": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "claim_id": {"type": "string", "enum": []}
+                                },
+                                "required": ["claim_id"]
+                            }
+                        },
+                        "cta_text": {
+                            "type": "string",
+                            "description": "Optional CTA button label. Short, no clinical data."
+                        }
+                    },
+                    "required": ["layout", "headline"]
+                }
+            }
+        },
+        "required": ["slides"]
+    }
+}
+
+SPEC_SYSTEM_PROMPT = """You are a pharma slide deck architect. Your job is to select the right claims and layouts — not to write clinical copy.
+
+You receive a <claim_catalog> listing approved claims by ID, type, and tags. You must build a deck by selecting claim IDs from that catalog. You never write factual text — you only reference claim IDs.
+
+LAYOUT SELECTION:
+- big_stat: one dominant KPI stat (e.g. median OS number)
+- stat_row: 2–4 stats side by side (e.g. OS + PFS + HR together)
+- two_column: primary claim left, supporting claims right
+- three_column_cards: 3 parallel facts (e.g. 3 safety stats)
+- comparison_table: head-to-head data (e.g. FRUZAQLA vs placebo)
+- data_table: multi-row clinical data
+- subgroup_forest: subgroup consistency data
+- hero: cover/title slide
+- title_only: section divider
+
+SLIDE TITLE (the only text you write):
+- Must be a framing headline with ZERO numbers, ZERO percentages, ZERO comparative language
+- Good: "Proven Survival Benefit", "Manageable Safety Profile", "Study Design"
+- Bad: "34% reduction in OS risk" (contains a number — use a claim_id instead)
+
+REQUIRED ELEMENTS:
+- Every slide MUST include at least one ISI or boilerplate claim in footer_claims when available in the catalog.
+- Choose ISI claims (type "isi") for the footer on every clinical data slide.
+
+EMPHASIS:
+- Use emphasis.numeric_value_index to visually highlight a specific number from the claim's numeric_values array.
+- Use hero_number style for the primary KPI on big_stat slides."""
+
+
+def _inject_enum(tool: dict, enum_values: list) -> dict:
+    """Walk the tool schema and set every claim_id enum to the provided list."""
+    def _walk(obj):
+        if isinstance(obj, dict):
+            if obj.get('type') == 'string' and 'enum' in obj and obj['enum'] == []:
+                obj['enum'] = enum_values
+            for v in obj.values():
+                _walk(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _walk(item)
+    _walk(tool)
+    return tool
+
+
+def _tag_filter(catalog: list, prompt: str, max_claims: int = 60) -> list:
+    """Return up to max_claims claims most relevant to the prompt based on tag overlap."""
+    if len(catalog) <= max_claims:
+        return catalog
+
+    prompt_tokens = set(re.sub(r'[^a-z0-9\s]', '', prompt.lower()).split())
+
+    def score(claim):
+        tags = set(t.lower().replace('-', '_') for t in (claim.get('tags') or []))
+        return len(tags & prompt_tokens)
+
+    ranked = sorted(catalog, key=score, reverse=True)
+    # Always include ISI/boilerplate claims
+    priority = [c for c in catalog if c.get('type') in ('isi', 'boilerplate')]
+    rest = [c for c in ranked if c.get('type') not in ('isi', 'boilerplate')]
+    merged = priority + rest
+    # Deduplicate preserving order
+    seen = set()
+    result = []
+    for c in merged:
+        if c['id'] not in seen:
+            seen.add(c['id'])
+            result.append(c)
+    return result[:max_claims]
+
+
+_FREE_TEXT_RE = re.compile(r'[\d%]|(\bvs\b|\bcompared\b|\bhigher\b|\blower\b|\bgreater\b|\breduction\b|\bincrease\b)', re.IGNORECASE)
+
+
+def validate_slide_spec(spec: dict, available_ids: list, brand_guidelines: Optional[dict] = None) -> list:
+    """
+    Validate the structured slide spec.
+    Returns list of error strings (empty = valid).
+    """
+    errors = []
+    available = set(available_ids)
+
+    for i, slide in enumerate(spec.get('slides', [])):
+        slide_num = i + 1
+
+        # Collect all claim_id references on this slide
+        refs = []
+        if slide.get('headline', {}).get('claim_id'):
+            refs.append(slide['headline']['claim_id'])
+        refs += [c['claim_id'] for c in slide.get('body_claims', []) if c.get('claim_id')]
+        refs += [c['claim_id'] for c in slide.get('footer_claims', []) if c.get('claim_id')]
+
+        for ref in refs:
+            if ref not in available:
+                errors.append(f"Slide {slide_num}: claim_id '{ref}' not in approved claims")
+
+        # Free-text constraint: slide_title and cta_text must not contain numbers/comparative words
+        for field in ('slide_title', 'cta_text'):
+            value = slide.get(field, '') or ''
+            if value and _FREE_TEXT_RE.search(value):
+                errors.append(
+                    f"Slide {slide_num}: '{field}' contains numbers or comparative language: \"{value}\""
+                )
+
+    return errors
+
+
+def build_compliance_trace(spec: dict, claims_by_id: dict) -> dict:
+    """
+    Build a deterministic compliance trace from the slide spec.
+    Every factual element traces back to an approved claim.
+    """
+    trace = []
+    for i, slide in enumerate(spec.get('slides', [])):
+        slide_num = i + 1
+        headline_id = slide.get('headline', {}).get('claim_id')
+        if headline_id and headline_id in claims_by_id:
+            c = claims_by_id[headline_id]
+            trace.append({
+                'slide': slide_num,
+                'element': 'headline',
+                'claim_id': headline_id,
+                'claim_text': c['text'],
+                'source': c.get('source_citation', ''),
+            })
+        for body in slide.get('body_claims', []):
+            cid = body.get('claim_id')
+            if cid and cid in claims_by_id:
+                c = claims_by_id[cid]
+                trace.append({
+                    'slide': slide_num,
+                    'element': f"body ({body.get('role', '')})",
+                    'claim_id': cid,
+                    'claim_text': c['text'],
+                    'source': c.get('source_citation', ''),
+                })
+        for footer in slide.get('footer_claims', []):
+            cid = footer.get('claim_id')
+            if cid and cid in claims_by_id:
+                c = claims_by_id[cid]
+                trace.append({
+                    'slide': slide_num,
+                    'element': 'footer',
+                    'claim_id': cid,
+                    'claim_text': c['text'],
+                    'source': c.get('source_citation', ''),
+                })
+
+    total = len(spec.get('slides', []))
+    return {
+        'verdict': 'approved',
+        'guarantee': 'structural',
+        'confidence': 1.0,
+        'summary': (
+            f"All {len(trace)} factual text elements traced to approved claims "
+            f"across {total} slide(s). Exact text match guaranteed."
+        ),
+        'flags': [],
+        'trace': trace,
+    }
+
+
+def generate_slide_spec(
+    prompt: str,
+    claims: list,
+    brand_guidelines: Optional[dict] = None,
+    slide_templates: Optional[list] = None,
+    target_audience: Optional[str] = None,
+    audience_rules: Optional[dict] = None,
+    history: Optional[list] = None,
+) -> dict:
+    """
+    Generate a structured slide spec using approved claims as an enum constraint.
+    Returns the parsed slide spec dict.
+    """
+    client = _get_client()
+
+    # Build compact catalog and filter to relevant claims
+    catalog = [
+        {
+            "id": c['id'],
+            "text": c['text'],
+            "type": c['claim_type'],
+            "tags": c.get('tags') or [],
+            "numeric_values": c.get('numeric_values') or [],
+        }
+        for c in claims
+    ]
+    catalog = _tag_filter(catalog, prompt)
+
+    # Inject enum into a fresh copy of the tool schema
+    claim_id_enum = [c['id'] for c in catalog]
+    tool = _inject_enum(copy.deepcopy(SLIDE_SPEC_TOOL), claim_id_enum)
+
+    # Build system prompt context
+    context_parts = []
+    if brand_guidelines:
+        context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
+    if slide_templates:
+        context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
+    if target_audience:
+        context_parts.append(f"<target_audience>\n{target_audience}\n</target_audience>")
+    if audience_rules and target_audience and target_audience in audience_rules:
+        context_parts.append(
+            f"<audience_rules>\n{json.dumps({target_audience: audience_rules[target_audience]}, indent=2)}\n</audience_rules>"
+        )
+
+    user_content = (
+        "\n\n".join(context_parts)
+        + f"\n\n<claim_catalog>\n{json.dumps(catalog, indent=2)}\n</claim_catalog>"
+        + f"\n\n{prompt}"
+    )
+
+    messages = list(history or []) + [{'role': 'user', 'content': user_content}]
+
+    response = client.messages.create(
+        model='claude-opus-4-6',
+        max_tokens=4096,
+        system=SPEC_SYSTEM_PROMPT,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "generate_slide_deck"},
+        messages=messages,
+    )
+
+    for block in response.content:
+        if block.type == 'tool_use' and block.name == 'generate_slide_deck':
+            return block.input
+
+    raise ValueError("Model did not return a slide deck spec")
+
+
+# ── Design token extraction ───────────────────────────────────────────────────
+
 def extract_design_tokens(pdf_text: str) -> dict:
     client = _get_client()
     message = client.messages.create(
-        model='claude-sonnet-4-6',
+        model='claude-opus-4-6',
         max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=[{

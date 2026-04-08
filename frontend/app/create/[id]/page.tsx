@@ -220,6 +220,8 @@ export default function SessionPage() {
   }, [])
 
   const [exporting, setExporting] = useState(false)
+  const [exportingJson, setExportingJson] = useState(false)
+  const [reviewStale, setReviewStale] = useState(false)
 
   const exportPdf = async () => {
     if (!currentHtml) return
@@ -438,6 +440,7 @@ export default function SessionPage() {
         setCurrentHtml(assistant.html_content)
         setEditContent(assistant.html_content)
         setCurrentReview(assistant.review_report ?? null)
+        setReviewStale(false)
         setReviewOpen(false)
         setViewMode('preview')
         if (htmlChanged) {
@@ -814,8 +817,16 @@ export default function SessionPage() {
         <div className="px-4 py-3 border-b border-slate-200 bg-white flex items-center justify-between">
           <div className="flex items-center gap-2">
             <p className="text-sm font-semibold text-slate-700">Output</p>
-            {currentReview && (
+            {currentReview && !reviewStale && (
               <VerdictBadge verdict={currentReview.verdict} />
+            )}
+            {currentReview && reviewStale && (
+              <span className="inline-flex items-center gap-1 rounded-full border border-yellow-200 bg-yellow-50 px-2 py-0.5 text-xs font-medium text-yellow-700">
+                <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+                </svg>
+                Edited — review out of date
+              </span>
             )}
           </div>
           <div className="flex items-center gap-2">
@@ -840,6 +851,34 @@ export default function SessionPage() {
                 className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-50"
               >
                 {exporting ? 'Exporting…' : 'Export PDF'}
+              </button>
+            )}
+            {currentHtml && (
+              <button
+                onClick={() => {
+                  setExportingJson(true)
+                  try {
+                    const payload = {
+                      html_content: currentHtml,
+                      review_report: currentReview,
+                      prompt: versions[activeVersionIdx ?? versions.length - 1]?.prompt ?? '',
+                      exported_at: new Date().toISOString(),
+                    }
+                    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+                    const url = URL.createObjectURL(blob)
+                    const a = document.createElement('a')
+                    a.href = url
+                    a.download = `slides-export-${Date.now()}.json`
+                    a.click()
+                    URL.revokeObjectURL(url)
+                  } finally {
+                    setExportingJson(false)
+                  }
+                }}
+                disabled={exportingJson}
+                className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-50"
+              >
+                Export JSON
               </button>
             )}
             {viewMode === 'edit' && (
@@ -881,8 +920,11 @@ export default function SessionPage() {
                           paneH={paneH}
                           onSave={(updated) => {
                             const all = parseSlides(currentHtml)
+                            const before = all.join('')
                             all[i] = updated
-                            setCurrentHtml(all.join(''))
+                            const after = all.join('')
+                            setCurrentHtml(after)
+                            if (after !== before && currentReview) setReviewStale(true)
                           }}
                         />
                       ))}
@@ -931,7 +973,7 @@ export default function SessionPage() {
                               setRestoringIdx(idx)
 
                               // Persist restore to DB so it survives refresh
-                              api.chat.restore(Number(id), v.html, v.review).then((saved) => {
+                              api.chat.restore(Number(id), v.html, v.review, v.prompt).then((saved) => {
                                 setMessages((prev) => [...prev, { role: 'assistant', content: saved.content }])
                               }).catch(console.error)
 
