@@ -164,6 +164,28 @@ The `hallmark` and `layoutPrinciples` define a visual language that must cascade
 
 5. LAYOUT: Apply `layoutPrinciples` literally — generous whitespace, structural elements (accent bars, gradient strokes, violators) placed correctly. Do not invent decorative patterns — colored card borders, side accents, divider lines, or any other visual element — that are not explicitly described in `brand_guidelines`, `slide_templates`, or `<design_tokens>`. If the brand does not specify card border colors, cards have no colored border. Every decoration must have a source in the guidelines.
 
+VISUAL BALANCE & ALIGNMENT — non-negotiable:
+- Every slide must read as visually balanced. No single region should carry significantly more visual weight than the others.
+
+COLUMNS:
+- All sibling columns in a row must have identical width — use `flex:1` or explicit equal percentages. Never give one column more width than another unless the layout explicitly calls for a sidebar ratio (e.g. 30/70).
+- All sibling columns must be equal height — set the row container to `align-items:stretch` and each column to `display:flex; flex-direction:column`.
+- When a column acts as a visual anchor (sidebar with an icon + label, or a support panel), center its content both horizontally and vertically within the full column height: `justify-content:center; align-items:center; text-align:center`.
+
+ICON + LABEL PAIRS:
+- An icon and its associated label text are always a single unit. Render them as `display:flex; flex-direction:column; align-items:center; text-align:center; gap:[consistent value]`. Never let the icon be left-aligned while the label is centered, or vice versa.
+- When this unit sits inside a column or panel, center the entire unit within that container using `justify-content:center`.
+
+CARDS:
+- Cards in a row must have identical width, identical padding, and identical border styling. Use `flex:1` on each card. Never hardcode different pixel widths for sibling cards.
+- Text inside cards must align consistently — all card titles share the same alignment, all card body text shares the same alignment.
+
+SPACING:
+- Use one gap value for all sibling spacing within a container. Never mix gap values (e.g. 12px between some items and 16px between others in the same row).
+
+CENTERING:
+- Never eyeball a center. Use `margin:0 auto`, `text-align:center`, `align-items:center`, or `justify-content:center` explicitly.
+
 POSITIONING — non-negotiable:
 - Use CSS flexbox or grid for ALL content layout. Never use position:absolute for content blocks, text, icons, cards, or any element that contains readable content — absolute positioning causes overlapping when content height varies.
 - position:absolute is permitted ONLY for purely decorative background elements (gradient overlays, hallmark arcs, background shapes) that sit behind content and contain no text.
