@@ -1,5 +1,8 @@
 import re
-from flask import Blueprint, request, jsonify
+import json
+import queue
+import threading
+from flask import Blueprint, request, jsonify, Response, current_app
 from extensions import db, socketio
 from models import Message, ChatSession, DesignSystem, DesignSystemAsset, KnowledgeItem, Claim
 from services.claude_service import (
@@ -10,6 +13,17 @@ from services.claude_service import (
 from services.renderer.renderer import render_deck
 
 chat_bp = Blueprint('chat', __name__)
+
+
+def _build_summary(spec, prompt):
+    """Deterministic summary from spec — replaces the LLM summary call."""
+    slides = spec.get('slides', []) if spec else []
+    n = len(slides)
+    if n == 0:
+        return 'Slides generated — check the output panel.'
+    layouts = [s.get('layout', 'unknown') for s in slides]
+    layout_str = ', '.join(dict.fromkeys(layouts))  # unique, order-preserved
+    return f"Created {n} slide{'s' if n != 1 else ''} ({layout_str}) for your request. Check the output panel to review."
 
 
 @chat_bp.route('/api/sessions/<int:session_id>/restore', methods=['POST'])
@@ -224,6 +238,7 @@ def send_message(session_id):
                         spec = edit_slide_spec(
                             prompt, prev_spec, claims_list, slim_history,
                             brand_guidelines=brand_guidelines,
+                            component_patterns=component_patterns,
                         )
                         spec_changed = (spec != prev_spec)
                         print(f"[DEBUG] edit_slide_spec: spec_changed={spec_changed}")
@@ -277,23 +292,9 @@ def send_message(session_id):
             component_patterns=component_patterns,
         )
 
-    # ── Summary after generation ──────────────────────────────────────────────
+    # ── Summary after generation (deterministic template, no LLM call) ───────
     if html_content and not chat_text:
-        summary_prompt = (
-            f"Slides were just generated in response to this request: \"{prompt}\". "
-            "In 1–2 sentences, tell the user what was produced and what they should look for in the output panel. "
-            "Be specific — mention layout type, key data, or any notable elements if you can infer them from the request."
-        )
-        try:
-            chat_text = chat_response(
-                summary_prompt,
-                kb_texts=None,
-                history=slim_history,
-                brand_guidelines=None,
-                ds_assets=None,
-            )
-        except Exception:
-            chat_text = 'Slides generated — check the output panel.'
+        chat_text = _build_summary(spec, prompt) if spec else 'Slides generated — check the output panel.'
 
     assistant_msg = Message(
         session_id=session_id,
@@ -314,3 +315,310 @@ def send_message(session_id):
         }, room=f'session:{session_id}')
 
     return jsonify(assistant_msg.to_dict()), 201
+
+
+def _sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@chat_bp.route('/api/sessions/<int:session_id>/messages/stream', methods=['POST'])
+def send_message_stream(session_id):
+    """SSE streaming endpoint — sends progress events as slides are generated."""
+    ChatSession.query.get_or_404(session_id)
+    data = request.get_json(force=True)
+    prompt = (data.get('prompt') or '').strip()
+    if not prompt:
+        return jsonify({'error': 'prompt is required'}), 400
+
+    current_draft = data.get('current_draft') or None
+    ds_id = data.get('design_system_id')
+    kb_doc_ids = data.get('kb_doc_ids') or []
+    target_audience = data.get('target_audience') or None
+
+    # Capture Flask app for thread-safe DB access
+    app = current_app._get_current_object()
+
+    # Pre-load all data we need inside the request context
+    design_tokens = None
+    brand_guidelines = None
+    component_patterns = None
+    ds_assets = []
+    audience_rules = None
+    if ds_id:
+        ds = DesignSystem.query.get(ds_id)
+        if ds:
+            design_tokens = ds.tokens
+            brand_guidelines = ds.brand_guidelines
+            component_patterns = ds.component_patterns
+            audience_rules = (ds.brand_guidelines or {}).get('audienceRules')
+            raw_assets = DesignSystemAsset.query.filter_by(design_system_id=ds_id).all()
+            ds_assets = [a.to_dict() for a in raw_assets]
+
+    prior_messages = (
+        Message.query.filter_by(session_id=session_id)
+        .order_by(Message.created_at.asc()).all()
+    )
+    slim_history = []
+    for m in prior_messages:
+        if m.role == 'user':
+            slim_history.append({'role': 'user', 'content': m.content})
+        else:
+            slim_history.append({'role': 'assistant', 'content': m.content or '[slides generated]'})
+
+    kb_texts = []
+    if kb_doc_ids:
+        items = KnowledgeItem.query.filter(KnowledgeItem.id.in_(kb_doc_ids)).all()
+        kb_texts = [item.text_content for item in items if item.text_content]
+
+    prev_spec = None
+    prev_html = None
+    for m in reversed(prior_messages):
+        rr = m.review_report
+        if rr and isinstance(rr, dict) and 'spec' in rr:
+            prev_spec = rr['spec']
+            prev_html = m.html_content
+            break
+
+    # Save user message
+    user_msg = Message(session_id=session_id, role='user', content=prompt)
+    db.session.add(user_msg)
+    db.session.commit()
+
+    ops = orchestrate(prompt, slim_history, has_kb=bool(kb_texts), has_deck=bool(prev_spec))
+
+    # Event queue for cross-thread communication
+    eq = queue.Queue()
+
+    def _run_pipeline():
+        """Runs the generation pipeline in a background thread, pushing SSE events."""
+        with app.app_context():
+            html_content = None
+            review_report = None
+            chat_text = None
+            spec = None
+
+            claims_list = []
+            claims_by_id = {}
+
+            if kb_doc_ids:
+                claims = Claim.query.filter(
+                    Claim.knowledge_id.in_(kb_doc_ids),
+                    Claim.is_approved == True,
+                ).all()
+                claims_list = [c.to_dict() for c in claims]
+                claims_by_id = {c['id']: c for c in claims_list}
+
+            if not claims_list and ('generate' in ops or 'edit' in ops):
+                eq.put(('chat', {
+                    'text': 'No approved claims found in the selected documents. '
+                            'Please review and approve claims on the Knowledge Base page before generating.'
+                }))
+                eq.put(('done', {}))
+                return
+
+            try:
+                # ── Edit path ─────────────────────────────────
+                if 'edit' in ops:
+                    if not prev_spec:
+                        eq.put(('chat', {'text': "There's no existing deck to edit yet. Try asking me to generate a new deck first."}))
+                        eq.put(('done', {}))
+                        return
+
+                    eq.put(('status', {'step': 'Editing slide spec...'}))
+                    spec = edit_slide_spec(
+                        prompt, prev_spec, claims_list, slim_history,
+                        brand_guidelines=brand_guidelines,
+                        component_patterns=component_patterns,
+                    )
+                    spec_changed = (spec != prev_spec)
+                    if not spec_changed and prev_html:
+                        html_content = prev_html
+                        review_report = build_compliance_trace(spec, claims_by_id)
+                        review_report['spec'] = spec
+                        eq.put(('html_complete', {'html': html_content}))
+                    else:
+                        eq.put(('status', {'step': 'Rendering slides...'}))
+
+                        def _on_edit_chunk(text):
+                            eq.put(('html_chunk', {'chunk': text}))
+
+                        # Finalize (validate + render)
+                        errors = validate_slide_spec(spec, list(claims_by_id.keys()), brand_guidelines)
+                        if errors:
+                            spec = generate_slide_spec(
+                                prompt + f"\n\nFix these validation errors: {'; '.join(errors)}",
+                                claims_list, brand_guidelines,
+                                target_audience, audience_rules, slim_history,
+                                component_patterns=component_patterns,
+                            )
+                        try:
+                            html_content = render_spec_to_html(
+                                spec, claims_by_id, design_tokens,
+                                brand_guidelines, ds_assets,
+                                current_html=prev_html,
+                                component_patterns=component_patterns,
+                                on_chunk=_on_edit_chunk,
+                            )
+                        except Exception:
+                            html_content = render_deck(
+                                spec, claims_by_id, design_tokens, brand_guidelines, ds_assets,
+                            )
+                        review_report = build_compliance_trace(spec, claims_by_id)
+                        review_report['spec'] = spec
+                        eq.put(('html_complete', {'html': html_content}))
+
+                # ── Generation path ───────────────────────────
+                elif 'generate' in ops:
+                    eq.put(('status', {'step': 'Planning narrative...'}))
+
+                    def _on_slide_ready(idx, slide):
+                        eq.put(('slide_ready', {'index': idx, 'layout': slide.get('layout', ''), 'title': slide.get('slide_title', '')}))
+
+                    spec = generate_slide_spec(
+                        prompt, claims_list, brand_guidelines,
+                        target_audience, audience_rules, slim_history,
+                        component_patterns=component_patterns,
+                        on_slide_ready=_on_slide_ready,
+                    )
+
+                    # Validate
+                    errors = validate_slide_spec(spec, list(claims_by_id.keys()), brand_guidelines)
+                    if errors:
+                        eq.put(('status', {'step': 'Fixing validation errors...'}))
+                        retry_spec = generate_slide_spec(
+                            prompt + f"\n\nFix these validation errors: {'; '.join(errors)}",
+                            claims_list, brand_guidelines,
+                            target_audience, audience_rules, slim_history,
+                            component_patterns=component_patterns,
+                        )
+                        retry_errors = validate_slide_spec(retry_spec, list(claims_by_id.keys()), brand_guidelines)
+                        if retry_errors:
+                            eq.put(('chat', {'text': f"Could not generate compliant slides: {'; '.join(retry_errors)}"}))
+                            eq.put(('done', {}))
+                            return
+                        spec = retry_spec
+
+                    # ISI injection (same logic as _finalize_spec)
+                    isi_claims = {cid: c for cid, c in claims_by_id.items() if c.get('claim_type') == 'isi'}
+                    if isi_claims:
+                        clinical = {'big_stat', 'stat_row', 'two_column', 'three_column_cards',
+                                    'comparison_table', 'data_table', 'subgroup_forest'}
+                        for slide in spec.get('slides', []):
+                            if slide.get('layout') in clinical:
+                                footer_ids = {fc.get('claim_id') for fc in slide.get('footer_claims', [])}
+                                if not any(cid in footer_ids for cid in isi_claims):
+                                    slide_cids = []
+                                    h = slide.get('headline', {}).get('claim_id')
+                                    if h:
+                                        slide_cids.append(h)
+                                    slide_cids += [b['claim_id'] for b in slide.get('body_claims', []) if b.get('claim_id')]
+                                    slide_tags = set()
+                                    for cid in slide_cids:
+                                        slide_tags.update(t.lower() for t in (claims_by_id.get(cid, {}).get('tags') or []))
+
+                                    def isi_relevance(isi_id):
+                                        isi_tags = set(t.lower() for t in (isi_claims[isi_id].get('tags') or []))
+                                        return len(isi_tags & slide_tags)
+
+                                    best_isi = max(isi_claims.keys(), key=isi_relevance)
+                                    slide.setdefault('footer_claims', []).append({'claim_id': best_isi})
+
+                    # Render HTML with streaming chunks
+                    eq.put(('status', {'step': 'Rendering slides...'}))
+
+                    def _on_render_chunk(text):
+                        eq.put(('html_chunk', {'chunk': text}))
+
+                    try:
+                        html_content = render_spec_to_html(
+                            spec, claims_by_id, design_tokens,
+                            brand_guidelines, ds_assets,
+                            component_patterns=component_patterns,
+                            on_chunk=_on_render_chunk,
+                        )
+                    except Exception:
+                        html_content = render_deck(
+                            spec, claims_by_id, design_tokens, brand_guidelines, ds_assets,
+                        )
+
+                    eq.put(('html_complete', {'html': html_content}))
+
+                    # Compliance (non-blocking — user already has HTML)
+                    review_report = build_compliance_trace(spec, claims_by_id)
+                    review_report['spec'] = spec
+                    if kb_texts:
+                        try:
+                            soft = review_content(html_content, kb_texts)
+                            review_report['soft_checks'] = soft
+                        except Exception:
+                            pass
+                    eq.put(('review', {'review_report': review_report}))
+
+                # ── Chat-only path ────────────────────────────
+                if 'chat' in ops and not chat_text and not html_content:
+                    eq.put(('status', {'step': 'Thinking...'}))
+                    chat_text = chat_response(
+                        prompt,
+                        kb_texts=kb_texts or None,
+                        history=slim_history,
+                        brand_guidelines=brand_guidelines,
+                        ds_assets=ds_assets,
+                        target_audience=target_audience,
+                        audience_rules=audience_rules,
+                        component_patterns=component_patterns,
+                    )
+
+                # Build summary
+                if html_content and not chat_text:
+                    chat_text = _build_summary(spec, prompt)
+
+                chat_text = chat_text or 'Slides generated — check the output panel.'
+                eq.put(('chat', {'text': chat_text}))
+
+                # Save assistant message
+                assistant_msg = Message(
+                    session_id=session_id,
+                    role='assistant',
+                    content=chat_text,
+                    html_content=html_content,
+                    review_report=review_report,
+                )
+                db.session.add(assistant_msg)
+                db.session.commit()
+
+                eq.put(('done', {'message': assistant_msg.to_dict() if assistant_msg else {}}))
+
+                if html_content:
+                    socketio.emit('presence:content_updated', {
+                        'session_id': session_id,
+                        'html': html_content,
+                        'message': chat_text,
+                    }, room=f'session:{session_id}')
+
+            except Exception as e:
+                eq.put(('chat', {'text': f'Generation failed: {e}'}))
+                # Save error message
+                err_msg = Message(session_id=session_id, role='assistant', content=f'Generation failed: {e}')
+                db.session.add(err_msg)
+                db.session.commit()
+                eq.put(('done', {'message': err_msg.to_dict()}))
+
+    def generate_sse():
+        thread = threading.Thread(target=_run_pipeline, daemon=True)
+        thread.start()
+
+        while True:
+            try:
+                event, payload = eq.get(timeout=120)
+            except queue.Empty:
+                yield _sse_event('done', {'error': 'timeout'})
+                return
+            yield _sse_event(event, payload)
+            if event == 'done':
+                return
+
+    return Response(
+        generate_sse(),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )

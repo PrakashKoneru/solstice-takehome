@@ -236,5 +236,92 @@ export const api = {
           target_audience: targetAudience ?? null,
         }),
       }),
+
+    sendStream: (
+      sessionId: number,
+      prompt: string,
+      callbacks: {
+        onStatus?: (step: string) => void
+        onSlideReady?: (index: number, layout: string, title: string) => void
+        onHtmlChunk?: (chunk: string) => void
+        onHtmlComplete?: (html: string) => void
+        onReview?: (report: ReviewReport) => void
+        onChat?: (text: string) => void
+        onDone?: (message: Message) => void
+      },
+      dsId?: number | '',
+      kbDocIds?: number[],
+      currentDraft?: string | null,
+      targetAudience?: string,
+    ) => {
+      const controller = new AbortController()
+      const promise = (async () => {
+        const res = await fetch(`${BASE}/api/sessions/${sessionId}/messages/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            prompt,
+            design_system_id: dsId || null,
+            kb_doc_ids: kbDocIds ?? [],
+            current_draft: currentDraft ?? null,
+            target_audience: targetAudience ?? null,
+          }),
+          signal: controller.signal,
+        })
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}))
+          throw new Error(body.error ?? `API error ${res.status}`)
+        }
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+        let buffer = ''
+
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+
+          const parts = buffer.split('\n\n')
+          buffer = parts.pop() || ''
+
+          for (const part of parts) {
+            const lines = part.split('\n')
+            let event = ''
+            let data = ''
+            for (const line of lines) {
+              if (line.startsWith('event: ')) event = line.slice(7)
+              else if (line.startsWith('data: ')) data = line.slice(6)
+            }
+            if (!event || !data) continue
+            const parsed = JSON.parse(data)
+
+            switch (event) {
+              case 'status':
+                callbacks.onStatus?.(parsed.step)
+                break
+              case 'slide_ready':
+                callbacks.onSlideReady?.(parsed.index, parsed.layout, parsed.title)
+                break
+              case 'html_chunk':
+                callbacks.onHtmlChunk?.(parsed.chunk)
+                break
+              case 'html_complete':
+                callbacks.onHtmlComplete?.(parsed.html)
+                break
+              case 'review':
+                callbacks.onReview?.(parsed.review_report)
+                break
+              case 'chat':
+                callbacks.onChat?.(parsed.text)
+                break
+              case 'done':
+                callbacks.onDone?.(parsed.message)
+                break
+            }
+          }
+        }
+      })()
+      return { promise, abort: () => controller.abort() }
+    },
   },
 }

@@ -51,19 +51,26 @@ const PRESENCE_COLORS = [
 function PresenceDots({ users, myUserId }: { users: PresenceUser[]; myUserId: string }) {
   const remoteUsers = users.filter((u) => u.user_id !== myUserId)
   if (remoteUsers.length === 0) return null
+  const label =
+    remoteUsers.length === 1
+      ? '1 other viewing'
+      : `${remoteUsers.length} others viewing`
+  const tooltip = remoteUsers.map((u) => u.display_name).join(', ')
   return (
-    <div className="flex items-center gap-1 ml-2">
-      {remoteUsers.map((u, i) => (
-        <div
-          key={u.user_id}
-          title={u.display_name}
-          className="h-2.5 w-2.5 rounded-full flex-shrink-0 ring-2 ring-white"
-          style={{ backgroundColor: PRESENCE_COLORS[i % PRESENCE_COLORS.length] }}
-        />
-      ))}
-      <span className="text-[10px] text-slate-400 ml-1">
-        {remoteUsers.length === 1 ? remoteUsers[0].display_name : `${remoteUsers.length} users`}
-      </span>
+    <div
+      className="flex items-center gap-1.5 rounded-full bg-slate-100 px-2 py-1"
+      title={tooltip}
+    >
+      <div className="flex items-center -space-x-1">
+        {remoteUsers.slice(0, 3).map((u, i) => (
+          <div
+            key={u.user_id}
+            className="h-2 w-2 rounded-full ring-1 ring-white"
+            style={{ backgroundColor: PRESENCE_COLORS[i % PRESENCE_COLORS.length] }}
+          />
+        ))}
+      </div>
+      <span className="text-[11px] text-slate-500 font-medium">{label}</span>
     </div>
   )
 }
@@ -272,6 +279,8 @@ function SessionPageInner() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const [streamStatus, setStreamStatus] = useState<string>('')
+  const htmlChunksRef = useRef<string>('')
   const [currentHtml, setCurrentHtml] = useState('')
   const [currentReview, setCurrentReview] = useState<ReviewReport | null>(null)
   const [reviewOpen, setReviewOpen] = useState(false)
@@ -544,30 +553,68 @@ function SessionPageInner() {
     setInput('')
     setMessages((prev) => [...prev, { role: 'user', content: userMessage }])
     setSending(true)
+    setStreamStatus('Thinking...')
+    htmlChunksRef.current = ''
+
+    const isFirstMessage = messages.length === 0
+    let receivedHtml = ''
+    let receivedReview: ReviewReport | null = null
+    let chatText = ''
+    let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
     try {
-      const isFirstMessage = messages.length === 0
-      const mode = selectedDocIds.size > 0 ? 'auto' : 'chat'
-      const assistant = await api.chat.send(
+      const { promise } = api.chat.sendStream(
         Number(id),
         userMessage,
+        {
+          onStatus: (step) => {
+            setStreamStatus(step)
+          },
+          onSlideReady: (index, layout, title) => {
+            setStreamStatus(`Built slide ${index + 1}: ${title || layout}`)
+          },
+          onHtmlChunk: (chunk) => {
+            htmlChunksRef.current += chunk
+            // Debounce preview updates to avoid excessive re-renders
+            if (debounceTimer) clearTimeout(debounceTimer)
+            debounceTimer = setTimeout(() => {
+              setCurrentHtml(htmlChunksRef.current)
+              setEditContent(htmlChunksRef.current)
+              setViewMode('preview')
+            }, 500)
+          },
+          onHtmlComplete: (html) => {
+            if (debounceTimer) clearTimeout(debounceTimer)
+            receivedHtml = html
+            setCurrentHtml(html)
+            setEditContent(html)
+            setViewMode('preview')
+          },
+          onReview: (report) => {
+            receivedReview = report
+            setCurrentReview(report)
+            setReviewStale(false)
+            setReviewOpen(false)
+          },
+          onChat: (text) => {
+            chatText = text
+          },
+          onDone: () => {
+            // Final state updates handled below after promise resolves
+          },
+        },
         selectedDsId,
         Array.from(selectedDocIds),
-        mode,
         currentHtml || null,
         targetAudience || undefined,
       )
-      setMessages((prev) => [...prev, { role: 'assistant', content: assistant.content }])
-      if (assistant.html_content) {
-        const htmlChanged = assistant.html_content !== currentHtml
-        setCurrentHtml(assistant.html_content)
-        setEditContent(assistant.html_content)
-        setCurrentReview(assistant.review_report ?? null)
-        setReviewStale(false)
-        setReviewOpen(false)
-        setViewMode('preview')
+      await promise
+
+      setMessages((prev) => [...prev, { role: 'assistant', content: chatText || 'Slides generated — check the output panel.' }])
+      if (receivedHtml) {
+        const htmlChanged = receivedHtml !== currentHtml
         if (htmlChanged) {
-          appendVersion(assistant.html_content, userMessage, assistant.review_report ?? null)
+          appendVersion(receivedHtml, userMessage, receivedReview)
         }
       }
       if (isFirstMessage && activeSession) {
@@ -583,6 +630,7 @@ function SessionPageInner() {
       setMessages((prev) => [...prev, { role: 'assistant', content: msg }])
     } finally {
       setSending(false)
+      setStreamStatus('')
     }
   }
 
@@ -884,6 +932,9 @@ function SessionPageInner() {
                   <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '0ms' }} />
                   <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '150ms' }} />
                   <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+                  {streamStatus && (
+                    <span className="ml-2 text-xs text-slate-500">{streamStatus}</span>
+                  )}
                 </div>
               </div>
             </div>
@@ -940,7 +991,6 @@ function SessionPageInner() {
         <div className="px-4 py-3 border-b border-slate-200 bg-white flex items-center justify-between">
           <div className="flex items-center gap-2">
             <p className="text-sm font-semibold text-slate-700">Output</p>
-            <PresenceDots users={presence.users} myUserId={presence.myIdentity.userId} />
             {currentReview && !reviewStale && (
               <VerdictBadge verdict={currentReview.verdict} />
             )}
@@ -954,6 +1004,7 @@ function SessionPageInner() {
             )}
           </div>
           <div className="flex items-center gap-2">
+            <PresenceDots users={presence.users} myUserId={presence.myIdentity.userId} />
             <div className="flex rounded-lg border border-slate-200 overflow-hidden">
               <button
                 onClick={() => setViewMode('edit')}

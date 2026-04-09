@@ -3,7 +3,8 @@ import os
 import re
 import json
 import anthropic
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Callable
 
 _client = None
 
@@ -317,17 +318,25 @@ CONTENT RULES:
 ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator for a pharma content studio. Your job is to read the user's message and conversation history, then decide which operation to run for this turn.
 
 Available operations:
-- "edit"      — modify specific aspects of an existing deck (change headlines, swap claims, add/remove slides, change layouts)
-- "generate"  — create a brand-new deck from scratch
+- "edit"      — modify an existing deck: change headlines, swap claims, ADD new slides, remove slides, change layouts, reorder
+- "generate"  — create a brand-new deck from scratch (throws away any existing deck)
 - "chat"      — answer questions, guide the user, explain what was done
+
+CRITICAL: When has_deck is true, the user almost always wants to iterate on the existing deck. Default to "edit" for any slide-related request unless they EXPLICITLY ask to throw away the current deck and start over.
 
 Classification rules (apply in order):
 1. If has_kb is false → return ["chat"] regardless of intent.
-2. If the user explicitly wants a fresh start ("build me a deck", "start over", "rebuild from scratch", "create new slides", "new deck", "generate a deck") → return ["generate"].
-3. If has_deck is true AND the user references modifying specific aspects of existing slides ("change slide 3 headline", "swap the claim", "add a slide about dosing", "remove slide 2", "update the title", "move slide 4", "edit the layout") → return ["edit"].
-4. If the user wants slides but has_deck is false → return ["generate"].
-5. Questions, exploration, or ambiguous requests → return ["chat"].
-6. When unsure → return ["chat"].
+
+2. If has_deck is true:
+   a. Only return ["generate"] if the user explicitly asks to discard the current deck and start fresh. Phrases that qualify: "start over", "rebuild from scratch", "throw this out", "scrap this and", "new deck from scratch", "redo the whole deck".
+   b. Otherwise, if the request is about slides in ANY way — adding ("add a slide about X", "create a slide for Y", "I also want a slide on Z", "can we have a slide about..."), modifying ("change slide 3", "swap the claim", "update the headline", "change the layout"), removing ("remove slide 2", "delete the last slide"), or reordering ("move slide 4") — return ["edit"]. Note: "create a slide" / "add a slide" in the context of an existing deck means ADD to it, not regenerate.
+   c. Questions or discussion about the deck → return ["chat"].
+
+3. If has_deck is false:
+   a. If the user wants slides ("build me a deck", "create slides", "generate a deck", "make a presentation") → return ["generate"].
+   b. Otherwise → return ["chat"].
+
+4. When unsure → return ["chat"].
 
 Never return more than one operation.
 
@@ -864,6 +873,7 @@ def render_spec_to_html(
     ds_assets: Optional[list] = None,
     current_html: Optional[str] = None,
     component_patterns: Optional[dict] = None,
+    on_chunk: Optional[Callable[[str], None]] = None,
 ) -> str:
     """
     Send validated slide spec to Claude for rich HTML rendering.
@@ -941,6 +951,8 @@ def render_spec_to_html(
     ) as stream:
         for text in stream.text_stream:
             result_chunks.append(text)
+            if on_chunk:
+                on_chunk(text)
     return ''.join(result_chunks).strip()
 
 
@@ -990,32 +1002,19 @@ EDIT_SPEC_TOOL = {
                             "type": "string",
                             "description": "New slide_title text (no numbers/percentages)"
                         },
-                        "new_slide": {
-                            "type": "object",
-                            "description": "Full slide object for add_slide action",
-                            "properties": {
-                                "layout": {"type": "string"},
-                                "slide_title": {"type": "string"},
-                                "headline": {"type": "object", "properties": {"claim_id": {"type": "string"}}},
-                                "body_claims": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "claim_id": {"type": "string"},
-                                            "role": {"type": "string"}
-                                        }
-                                    }
-                                },
-                                "footer_claims": {
-                                    "type": "array",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {"claim_id": {"type": "string"}}
-                                    }
-                                }
-                            },
-                            "required": ["layout", "slide_title", "headline", "body_claims"]
+                        "new_slide_topic": {
+                            "type": "string",
+                            "description": "Short topic description for the new slide (e.g. 'PFS subgroup analysis in elderly patients'). Used with add_slide."
+                        },
+                        "new_slide_claim_types": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Relevant claim types for the new slide (e.g. efficacy, safety, dosing). Used with add_slide."
+                        },
+                        "new_slide_keywords": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Key terms for claim filtering for the new slide. Used with add_slide."
                         },
                         "insert_after": {
                             "type": "integer",
@@ -1039,7 +1038,7 @@ Actions:
 - remove_body_claim: remove a body_claim by index
 - change_layout: change a slide's layout type
 - change_title: change a slide's slide_title text
-- add_slide: insert a new slide. Provide new_slide (full slide object with layout, slide_title, headline, body_claims, footer_claims) and insert_after (0-based index; -1 for beginning). Set slide_index to 0 (ignored for add_slide).
+- add_slide: insert a new slide. Provide new_slide_topic (short description of what the slide should cover), optionally new_slide_claim_types and new_slide_keywords to help select relevant claims, and insert_after (0-based index; -1 for beginning). The slide itself will be built by the downstream generation pipeline — do NOT attempt to pick claims or layout yourself. Set slide_index to 0 (ignored for add_slide).
 - remove_slide: delete a slide at slide_index
 
 Rules:
@@ -1056,6 +1055,7 @@ def edit_slide_spec(
     claims: list,
     history: Optional[list] = None,
     brand_guidelines: Optional[dict] = None,
+    component_patterns: Optional[dict] = None,
 ) -> dict:
     """
     Apply targeted edits to an existing spec. Returns the modified spec.
@@ -1178,11 +1178,32 @@ def edit_slide_spec(
         if 0 <= idx < len(slides):
             slides.pop(idx)
 
-    # Pass 3: insert new slides in forward order
+    # Pass 3: insert new slides in forward order, running each through the
+    # full per-slide generation pipeline (prefilter → select → build) so new
+    # slides follow the same quality/compliance rules as fresh generation.
     for edit in sorted(adds, key=lambda e: e.get('insert_after', len(slides))):
-        new_slide = edit.get('new_slide')
-        if not new_slide:
+        topic = edit.get('new_slide_topic')
+        if not topic:
+            print(f"[WARN] add_slide edit missing new_slide_topic, skipping")
             continue
+
+        slide_plan = {
+            'topic': topic,
+            'claim_types': edit.get('new_slide_claim_types', []),
+            'keywords': edit.get('new_slide_keywords', []),
+        }
+        try:
+            candidates = _prefilter_claims(claims, slide_plan)
+            print(f"[DEBUG] add_slide pre-filtered {len(candidates)} candidates for '{topic}'")
+            selected = _select_claims(topic, candidates)
+            new_slide = _build_slide(
+                topic, selected, claims,
+                brand_guidelines, component_patterns,
+            )
+        except Exception as e:
+            print(f"[WARN] add_slide pipeline failed for '{topic}': {e}")
+            continue
+
         insert_after = edit.get('insert_after', len(slides) - 1)
         insert_pos = insert_after + 1 if insert_after >= 0 else 0
         insert_pos = min(insert_pos, len(slides))
@@ -1608,6 +1629,7 @@ def generate_slide_spec(
     audience_rules: Optional[dict] = None,
     history: Optional[list] = None,
     component_patterns: Optional[dict] = None,
+    on_slide_ready: Optional[Callable] = None,
 ) -> dict:
     """
     Incremental per-slide generation pipeline.
@@ -1618,10 +1640,12 @@ def generate_slide_spec(
     plan = _plan_narrative(prompt, claims, brand_guidelines,
                            target_audience, audience_rules, history)
 
-    slides = []
-    for slide_plan in plan.get('slides', []):
+    slide_plans = plan.get('slides', [])
+
+    def _process_slide(idx_and_plan):
+        idx, slide_plan = idx_and_plan
         topic = slide_plan['topic']
-        print(f"[DEBUG] Processing slide: {topic}")
+        print(f"[DEBUG] Processing slide {idx}: {topic}")
 
         # Step 1a: Programmatic pre-filter
         candidates = _prefilter_claims(claims, slide_plan)
@@ -1633,7 +1657,20 @@ def generate_slide_spec(
         # Steps 2+3+4: Build slide
         slide = _build_slide(topic, selected, claims,
                              brand_guidelines, component_patterns)
-        slides.append(slide)
+        if on_slide_ready:
+            on_slide_ready(idx, slide)
+        return idx, slide
+
+    # Run slides in parallel — each slide's LLM calls are independent
+    slides = [None] * len(slide_plans)
+    with ThreadPoolExecutor(max_workers=min(len(slide_plans), 5)) as executor:
+        futures = {
+            executor.submit(_process_slide, (i, sp)): i
+            for i, sp in enumerate(slide_plans)
+        }
+        for future in as_completed(futures):
+            idx, slide = future.result()
+            slides[idx] = slide
 
     return {"slides": slides}
 
