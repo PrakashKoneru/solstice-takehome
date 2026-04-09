@@ -15,17 +15,6 @@ from services.renderer.renderer import render_deck
 chat_bp = Blueprint('chat', __name__)
 
 
-def _build_summary(spec, prompt):
-    """Deterministic summary from spec — replaces the LLM summary call."""
-    slides = spec.get('slides', []) if spec else []
-    n = len(slides)
-    if n == 0:
-        return 'Slides generated — check the output panel.'
-    layouts = [s.get('layout', 'unknown') for s in slides]
-    layout_str = ', '.join(dict.fromkeys(layouts))  # unique, order-preserved
-    return f"Created {n} slide{'s' if n != 1 else ''} ({layout_str}) for your request. Check the output panel to review."
-
-
 @chat_bp.route('/api/sessions/<int:session_id>/restore', methods=['POST'])
 def restore_version(session_id):
     ChatSession.query.get_or_404(session_id)
@@ -238,7 +227,6 @@ def send_message(session_id):
                         spec = edit_slide_spec(
                             prompt, prev_spec, claims_list, slim_history,
                             brand_guidelines=brand_guidelines,
-                            component_patterns=component_patterns,
                         )
                         spec_changed = (spec != prev_spec)
                         print(f"[DEBUG] edit_slide_spec: spec_changed={spec_changed}")
@@ -292,9 +280,23 @@ def send_message(session_id):
             component_patterns=component_patterns,
         )
 
-    # ── Summary after generation (deterministic template, no LLM call) ───────
+    # ── Summary after generation ──────────────────────────────────────────────
     if html_content and not chat_text:
-        chat_text = _build_summary(spec, prompt) if spec else 'Slides generated — check the output panel.'
+        summary_prompt = (
+            f"Slides were just generated in response to this request: \"{prompt}\". "
+            "In 1–2 sentences, tell the user what was produced and what they should look for in the output panel. "
+            "Be specific — mention layout type, key data, or any notable elements if you can infer them from the request."
+        )
+        try:
+            chat_text = chat_response(
+                summary_prompt,
+                kb_texts=None,
+                history=slim_history,
+                brand_guidelines=None,
+                ds_assets=None,
+            )
+        except Exception:
+            chat_text = 'Slides generated — check the output panel.'
 
     assistant_msg = Message(
         session_id=session_id,
@@ -428,7 +430,6 @@ def send_message_stream(session_id):
                     spec = edit_slide_spec(
                         prompt, prev_spec, claims_list, slim_history,
                         brand_guidelines=brand_guidelines,
-                        component_patterns=component_patterns,
                     )
                     spec_changed = (spec != prev_spec)
                     if not spec_changed and prev_html:
@@ -568,9 +569,24 @@ def send_message_stream(session_id):
                         component_patterns=component_patterns,
                     )
 
-                # Build summary
+                # Build summary (LLM-based, matches non-streaming path)
                 if html_content and not chat_text:
-                    chat_text = _build_summary(spec, prompt)
+                    eq.put(('status', {'step': 'Summarizing...'}))
+                    summary_prompt = (
+                        f"Slides were just generated in response to this request: \"{prompt}\". "
+                        "In 1–2 sentences, tell the user what was produced and what they should look for in the output panel. "
+                        "Be specific — mention layout type, key data, or any notable elements if you can infer them from the request."
+                    )
+                    try:
+                        chat_text = chat_response(
+                            summary_prompt,
+                            kb_texts=None,
+                            history=slim_history,
+                            brand_guidelines=None,
+                            ds_assets=None,
+                        )
+                    except Exception:
+                        chat_text = 'Slides generated — check the output panel.'
 
                 chat_text = chat_text or 'Slides generated — check the output panel.'
                 eq.put(('chat', {'text': chat_text}))

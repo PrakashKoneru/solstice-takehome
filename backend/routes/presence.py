@@ -12,9 +12,18 @@ def _room(session_id: int) -> str:
 
 def _broadcast_users(session_id: int):
     room = _room(session_id)
+    # Dedupe by user_id — a single user may have multiple socket sids due to
+    # reconnects, StrictMode double-mount, or hot reload. Prefer the entry
+    # that's actively editing a slide (if any).
+    by_user: dict[str, dict] = {}
+    for info in _presence.get(session_id, {}).values():
+        uid = info['user_id']
+        existing = by_user.get(uid)
+        if existing is None or (existing.get('editing_slide') is None and info.get('editing_slide') is not None):
+            by_user[uid] = info
     users = [
         {'user_id': info['user_id'], 'display_name': info['display_name'], 'editing_slide': info.get('editing_slide')}
-        for info in _presence.get(session_id, {}).values()
+        for info in by_user.values()
     ]
     socketio.emit('presence:users_changed', {'session_id': session_id, 'users': users}, room=room)
 

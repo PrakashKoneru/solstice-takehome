@@ -54,7 +54,7 @@ function PresenceDots({ users, myUserId }: { users: PresenceUser[]; myUserId: st
   const label =
     remoteUsers.length === 1
       ? '1 other viewing'
-      : `${remoteUsers.length} others viewing`
+      : `${remoteUsers.length - 1} others viewing`
   const tooltip = remoteUsers.map((u) => u.display_name).join(', ')
   return (
     <div
@@ -575,12 +575,13 @@ function SessionPageInner() {
           },
           onHtmlChunk: (chunk) => {
             htmlChunksRef.current += chunk
-            // Debounce preview updates to avoid excessive re-renders
+            // Debounce preview updates to avoid excessive re-renders.
+            // IMPORTANT: only touch currentHtml (the preview). Do NOT overwrite
+            // editContent or flip viewMode — partial HTML would corrupt the
+            // editor and yanking the user out of edit mode is jarring.
             if (debounceTimer) clearTimeout(debounceTimer)
             debounceTimer = setTimeout(() => {
               setCurrentHtml(htmlChunksRef.current)
-              setEditContent(htmlChunksRef.current)
-              setViewMode('preview')
             }, 500)
           },
           onHtmlComplete: (html) => {
@@ -588,7 +589,6 @@ function SessionPageInner() {
             receivedHtml = html
             setCurrentHtml(html)
             setEditContent(html)
-            setViewMode('preview')
           },
           onReview: (report) => {
             receivedReview = report
@@ -613,6 +613,7 @@ function SessionPageInner() {
       setMessages((prev) => [...prev, { role: 'assistant', content: chatText || 'Slides generated — check the output panel.' }])
       if (receivedHtml) {
         const htmlChanged = receivedHtml !== currentHtml
+        setViewMode('preview')
         if (htmlChanged) {
           appendVersion(receivedHtml, userMessage, receivedReview)
         }
