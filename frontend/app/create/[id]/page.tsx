@@ -294,6 +294,8 @@ function SessionPageInner() {
   const ghostRef = useRef<HTMLDivElement>(null)
   const dotRefs = useRef<Map<number, HTMLButtonElement>>(new Map())
   const innerScrollRef = useRef<HTMLDivElement>(null)
+  const manualEditSaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pendingManualEditHtml = useRef<string | null>(null)
 
   const [designSystems, setDesignSystems] = useState<DesignSystem[]>([])
   const [selectedDsId, setSelectedDsId] = useState<number | ''>('')
@@ -1104,6 +1106,26 @@ function SessionPageInner() {
                               if (after !== before) {
                                 if (currentReview) setReviewStale(true)
                                 presence.broadcastSlideSave(i, updated)
+                                // Debounce DB persistence so rapid edits
+                                // collapse into a single version entry.
+                                pendingManualEditHtml.current = after
+                                if (manualEditSaveTimer.current) {
+                                  clearTimeout(manualEditSaveTimer.current)
+                                }
+                                manualEditSaveTimer.current = setTimeout(() => {
+                                  const html = pendingManualEditHtml.current
+                                  pendingManualEditHtml.current = null
+                                  manualEditSaveTimer.current = null
+                                  if (!html) return
+                                  api.chat
+                                    .restore(Number(id), html, currentReview, 'Manual edit')
+                                    .then((saved) => {
+                                      appendVersion(html, 'Manual edit', currentReview)
+                                    })
+                                    .catch((err) => {
+                                      console.error('Manual edit save failed:', err)
+                                    })
+                                }, 1500)
                               }
                             }}
                           />

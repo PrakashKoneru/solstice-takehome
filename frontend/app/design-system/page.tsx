@@ -52,7 +52,7 @@ function ExtractionTimeline({ dsId, onDone }: { dsId: number; onDone: (ds: Desig
   return (
     <div className="flex flex-1 items-center justify-center bg-slate-50">
       <div className="w-72">
-        <p className="text-sm font-semibold text-slate-800 mb-6 text-center">Extracting Design System</p>
+        <p className="text-sm font-semibold text-slate-800 mb-6">Extracting Design System</p>
         <div className="relative pl-8">
           {EXTRACTION_STEPS.map((step, i) => {
             const isDone = i < completed
