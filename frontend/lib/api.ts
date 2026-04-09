@@ -1,10 +1,18 @@
 const BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001'
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  })
+  let res: Response
+  try {
+    res = await fetch(`${BASE}${path}`, {
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    })
+  } catch (err) {
+    // Convert low-level network errors (fetch TypeErrors) into a regular
+    // Error so callers can handle them uniformly and the Next.js dev
+    // overlay doesn't treat them as unhandled TypeErrors.
+    throw new Error(`Network error: ${err instanceof Error ? err.message : 'unknown'} (${path})`)
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body.error ?? `API error ${res.status}`)
@@ -13,7 +21,12 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
 }
 
 async function upload<T>(path: string, formData: FormData, method = 'POST'): Promise<T> {
-  const res = await fetch(`${BASE}${path}`, { method, body: formData })
+  let res: Response
+  try {
+    res = await fetch(`${BASE}${path}`, { method, body: formData })
+  } catch (err) {
+    throw new Error(`Network error: ${err instanceof Error ? err.message : 'unknown'} (${path})`)
+  }
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new Error(body.error ?? `API error ${res.status}`)

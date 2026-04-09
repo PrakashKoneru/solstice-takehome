@@ -88,7 +88,29 @@ function EditableSlide({ html, onSave, paneH, slideIndex, onFocusSlide, onBlurSl
   const innerRef = useRef<HTMLDivElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const [scaledH, setScaledH] = React.useState(paneH)
+  // Tracks the html string we last imperatively pushed into the DOM.
+  // When the parent sends back an updated html prop that's identical to
+  // what's already in the DOM (e.g. our own emitted edit round-tripping
+  // through React state), we skip the re-injection and avoid the flicker.
+  const lastAppliedRef = useRef<string>('')
+  const isFocusedRef = useRef(false)
+  // Set to true the moment we emit via onSave. The NEXT styledHtml prop
+  // update is expected to be the round-trip of our own emission (the
+  // parent's setState echoing back). We absorb that update without
+  // re-injecting the DOM, since the user's edit is already live.
+  const justEmittedRef = useRef(false)
 
+  // Inject claim-locked styles into the slide HTML
+  const styledHtml = React.useMemo(() => {
+    const s = sanitizeHtml(html)
+    if (s.includes('data-claim-id') && !s.includes('claim-locked-injected')) {
+      return `<style class="claim-locked-injected">${CLAIM_LOCKED_STYLE}</style>${s}`
+    }
+    return s
+  }, [html])
+
+  // Scale/resize — only runs on mount and when paneH changes, NOT on every
+  // html change. The visible dimensions don't depend on text content.
   useEffect(() => {
     const wrap = wrapRef.current
     const inner = innerRef.current
@@ -102,16 +124,27 @@ function EditableSlide({ html, onSave, paneH, slideIndex, onFocusSlide, onBlurSl
     const ro = new ResizeObserver(apply)
     ro.observe(wrap)
     return () => ro.disconnect()
-  }, [html, paneH])
+  }, [paneH])
 
-  // Inject claim-locked styles into the slide HTML
-  const styledHtml = React.useMemo(() => {
-    const s = sanitizeHtml(html)
-    if (s.includes('data-claim-id') && !s.includes('claim-locked-injected')) {
-      return `<style class="claim-locked-injected">${CLAIM_LOCKED_STYLE}</style>${s}`
+  // Imperative innerHTML sync. Only writes to the DOM when it's actually
+  // needed (external update from parent). Skips when:
+  //   - The user just emitted (round-trip of their own edit)
+  //   - The incoming styledHtml matches what we last pushed
+  //   - The user is currently focused (don't clobber in-progress edits)
+  useEffect(() => {
+    const inner = innerRef.current
+    if (!inner) return
+    if (justEmittedRef.current) {
+      // Absorb the round-trip without touching the DOM
+      justEmittedRef.current = false
+      lastAppliedRef.current = styledHtml
+      return
     }
-    return s
-  }, [html])
+    if (styledHtml === lastAppliedRef.current) return
+    if (isFocusedRef.current) return
+    inner.innerHTML = styledHtml
+    lastAppliedRef.current = styledHtml
+  }, [styledHtml])
 
   const isRemoteEditing = !!remoteEditor
 
@@ -127,9 +160,16 @@ function EditableSlide({ html, onSave, paneH, slideIndex, onFocusSlide, onBlurSl
         contentEditable={!isRemoteEditing}
         suppressContentEditableWarning
         style={{ width: 1024, height: 576, transformOrigin: 'center center', flexShrink: 0, overflow: 'hidden', outline: 'none', opacity: isRemoteEditing ? 0.7 : 1 }}
-        dangerouslySetInnerHTML={{ __html: styledHtml }}
-        onFocus={() => { if (slideIndex !== undefined) onFocusSlide?.(slideIndex) }}
+        onFocus={() => {
+          isFocusedRef.current = true
+          if (slideIndex !== undefined) onFocusSlide?.(slideIndex)
+        }}
         onBlur={(e) => {
+          isFocusedRef.current = false
+          // The DOM now contains the user's edit. Flag that the next prop
+          // update is our own emission round-tripping — the sync effect
+          // will absorb it without re-injecting.
+          justEmittedRef.current = true
           onSave(e.currentTarget.outerHTML)
           onBlurSlide?.()
         }}
@@ -563,7 +603,9 @@ function SessionPageInner() {
     let receivedHtml = ''
     let receivedReview: ReviewReport | null = null
     let chatText = ''
-    let serverMessage: Message | null = null
+    // Ref-style holder so TypeScript's control-flow analysis doesn't
+    // narrow this to `never` across the closure + await boundary.
+    const serverMessageRef: { current: ApiMessage | null } = { current: null }
     let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
     try {
@@ -608,7 +650,7 @@ function SessionPageInner() {
             // and html_content). This is our confirmation that the server
             // persisted the write — it's the only safe trigger for
             // appending to the versions array.
-            serverMessage = message
+            serverMessageRef.current = message
           },
         },
         selectedDsId,
@@ -624,14 +666,15 @@ function SessionPageInner() {
       // server-committed message is the source of truth for both the
       // HTML body and the review report — never trust the local stream
       // buffers for persistence decisions.
-      if (serverMessage && serverMessage.html_content) {
-        const htmlChanged = serverMessage.html_content !== currentHtml
+      const committed = serverMessageRef.current
+      if (committed && committed.html_content) {
+        const htmlChanged = committed.html_content !== currentHtml
         setViewMode('preview')
         if (htmlChanged) {
           appendVersion(
-            serverMessage.html_content,
+            committed.html_content,
             userMessage,
-            serverMessage.review_report ?? null,
+            committed.review_report ?? null,
           )
         }
       }
@@ -1009,6 +1052,12 @@ function SessionPageInner() {
         <div className="px-4 py-3 border-b border-slate-200 bg-white flex items-center justify-between">
           <div className="flex items-center gap-2">
             <p className="text-sm font-semibold text-slate-700">Output</p>
+            {currentReview && !reviewStale && (
+              <span className="inline-flex items-center gap-1.5">
+                <span className="text-xs font-medium text-slate-500">Review Status:</span>
+                <VerdictBadge verdict={currentReview.verdict} />
+              </span>
+            )}
             {currentReview && reviewStale && (
               <span className="inline-flex items-center gap-1 rounded-full border border-yellow-200 bg-yellow-50 px-2 py-0.5 text-xs font-medium text-yellow-700">
                 <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1102,7 +1151,7 @@ function SessionPageInner() {
                         ) ?? null
                         return (
                           <EditableSlide
-                            key={`${i}-${slideHtml.length}-${slideHtml.slice(0, 80)}`}
+                            key={i}
                             html={slideHtml}
                             paneH={paneH}
                             slideIndex={i}
@@ -1131,12 +1180,16 @@ function SessionPageInner() {
                                   if (!html) return
                                   // 1. Rerun compliance review against the new HTML
                                   //    so the saved message carries a fresh verdict.
+                                  //    Best-effort — if the network fails we just
+                                  //    keep the previous review and move on.
                                   let freshReview: ReviewReport | null = currentReview
                                   setReviewRerunning(true)
                                   try {
                                     freshReview = await api.chat.rerunReview(Number(id), html)
                                   } catch (err) {
-                                    console.error('Review rerun failed:', err)
+                                    // console.warn (not error) so Next.js's dev
+                                    // overlay doesn't surface this as a red banner.
+                                    console.warn('[manual-edit] review rerun skipped:', err)
                                   }
                                   // 2. Persist the manual edit + fresh review to DB
                                   try {
@@ -1145,7 +1198,7 @@ function SessionPageInner() {
                                     setReviewStale(false)
                                     appendVersion(html, 'Manual edit', freshReview)
                                   } catch (err) {
-                                    console.error('Manual edit save failed:', err)
+                                    console.warn('[manual-edit] save failed:', err)
                                   } finally {
                                     setReviewRerunning(false)
                                   }
@@ -1281,16 +1334,14 @@ function SessionPageInner() {
                       Compliance Review
                     </span>
                     <span className="flex items-center gap-2">
-                      {reviewRerunning ? (
+                      {reviewRerunning && (
                         <span className="flex items-center gap-1 text-[11px] font-medium text-slate-400">
                           <svg className="h-3 w-3 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <circle cx="12" cy="12" r="10" strokeWidth={3} strokeDasharray="40 20" />
                           </svg>
                           Rechecking…
                         </span>
-                      ) : !reviewStale ? (
-                        <VerdictBadge verdict={currentReview.verdict} />
-                      ) : null}
+                      )}
                       <svg className={`h-3.5 w-3.5 transition-transform ${reviewOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
                       </svg>
