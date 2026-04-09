@@ -6,6 +6,7 @@ import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
 import { api, type Session, type DesignSystem, type KnowledgeItem, type Message as ApiMessage, type ReviewReport } from '@/lib/api'
 import jsPDF from 'jspdf'
+import { PresenceProvider, usePresence, type PresenceUser, type CursorPosition } from '@/contexts/PresenceContext'
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string }
 type Version = { html: string; prompt: string; review: ReviewReport | null }
@@ -43,7 +44,40 @@ const CLAIM_LOCKED_STYLE = `
   }
 `
 
-const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }: { html: string; onSave: (updated: string) => void; paneH: number }) {
+const PRESENCE_COLORS = [
+  '#f59e0b', '#10b981', '#8b5cf6', '#ef4444', '#06b6d4', '#ec4899', '#f97316', '#14b8a6',
+]
+
+function PresenceDots({ users, myUserId }: { users: PresenceUser[]; myUserId: string }) {
+  const remoteUsers = users.filter((u) => u.user_id !== myUserId)
+  if (remoteUsers.length === 0) return null
+  return (
+    <div className="flex items-center gap-1 ml-2">
+      {remoteUsers.map((u, i) => (
+        <div
+          key={u.user_id}
+          title={u.display_name}
+          className="h-2.5 w-2.5 rounded-full flex-shrink-0 ring-2 ring-white"
+          style={{ backgroundColor: PRESENCE_COLORS[i % PRESENCE_COLORS.length] }}
+        />
+      ))}
+      <span className="text-[10px] text-slate-400 ml-1">
+        {remoteUsers.length === 1 ? remoteUsers[0].display_name : `${remoteUsers.length} users`}
+      </span>
+    </div>
+  )
+}
+
+function RemoteEditingBadge({ editor }: { editor: PresenceUser }) {
+  return (
+    <div className="absolute top-0 left-0 right-0 z-10 flex items-center gap-1.5 bg-amber-50 border-b border-amber-300 px-3 py-1">
+      <div className="h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+      <span className="text-xs text-amber-700 font-medium">{editor.display_name} is editing...</span>
+    </div>
+  )
+}
+
+function EditableSlide({ html, onSave, paneH, slideIndex, onFocusSlide, onBlurSlide, remoteEditor }: { html: string; onSave: (updated: string) => void; paneH: number; slideIndex?: number; onFocusSlide?: (i: number) => void; onBlurSlide?: () => void; remoteEditor?: PresenceUser | null }) {
   const innerRef = useRef<HTMLDivElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
   const [scaledH, setScaledH] = React.useState(paneH)
@@ -72,24 +106,32 @@ const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }:
     return s
   }, [html])
 
+  const isRemoteEditing = !!remoteEditor
+
   return (
     <div
       ref={wrapRef}
-      style={{ width: '100%', height: scaledH, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}
+      className="relative"
+      style={{ width: '100%', height: scaledH, display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0, border: isRemoteEditing ? '2px solid #f59e0b' : undefined, borderRadius: isRemoteEditing ? 4 : undefined }}
     >
+      {remoteEditor && <RemoteEditingBadge editor={remoteEditor} />}
       <div
         ref={innerRef}
-        contentEditable
+        contentEditable={!isRemoteEditing}
         suppressContentEditableWarning
-        style={{ width: 1024, height: 576, transformOrigin: 'center center', flexShrink: 0, overflow: 'hidden', outline: 'none' }}
+        style={{ width: 1024, height: 576, transformOrigin: 'center center', flexShrink: 0, overflow: 'hidden', outline: 'none', opacity: isRemoteEditing ? 0.7 : 1 }}
         dangerouslySetInnerHTML={{ __html: styledHtml }}
-        onBlur={(e) => onSave(e.currentTarget.outerHTML)}
+        onFocus={() => { if (slideIndex !== undefined) onFocusSlide?.(slideIndex) }}
+        onBlur={(e) => {
+          onSave(e.currentTarget.outerHTML)
+          onBlurSlide?.()
+        }}
       />
     </div>
   )
-})
+}
 
-const SlidePreview = React.memo(function SlidePreview({ html, paneH }: { html: string; paneH: number }) {
+function SlidePreview({ html, paneH }: { html: string; paneH: number }) {
   const wrapRef = useRef<HTMLDivElement>(null)
   const innerRef = useRef<HTMLDivElement>(null)
   const [scaledH, setScaledH] = React.useState(paneH)
@@ -121,7 +163,28 @@ const SlidePreview = React.memo(function SlidePreview({ html, paneH }: { html: s
       />
     </div>
   )
-})
+}
+
+const CURSOR_COLORS = ['#ef4444', '#3b82f6', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899']
+
+function RemoteCursor({ name, x, y, color }: { name: string; x: number; y: number; color: string }) {
+  return (
+    <div
+      className="pointer-events-none absolute z-50 transition-all duration-100 ease-out"
+      style={{ left: `${x * 100}%`, top: `${y * 100}%` }}
+    >
+      <svg width="16" height="20" viewBox="0 0 16 20" fill="none" style={{ filter: 'drop-shadow(0 1px 2px rgba(0,0,0,0.3))' }}>
+        <path d="M0 0L16 12L6.4 12L0 20V0Z" fill={color} />
+      </svg>
+      <span
+        className="absolute left-4 top-3 whitespace-nowrap rounded px-1.5 py-0.5 text-[10px] font-medium text-white"
+        style={{ backgroundColor: color }}
+      >
+        {name}
+      </span>
+    </div>
+  )
+}
 
 const PINNED_LINKS = [
   {
@@ -189,6 +252,15 @@ function StatusChip({ status }: { status: 'verified' | 'unsupported' | 'inferred
 }
 
 export default function SessionPage() {
+  const { id } = useParams<{ id: string }>()
+  return (
+    <PresenceProvider sessionId={Number(id)}>
+      <SessionPageInner />
+    </PresenceProvider>
+  )
+}
+
+function SessionPageInner() {
   const router = useRouter()
   const { id } = useParams<{ id: string }>()
 
@@ -239,8 +311,40 @@ export default function SessionPage() {
   }, [])
 
   const [exporting, setExporting] = useState(false)
-  const [exportingJson, setExportingJson] = useState(false)
+
   const [reviewStale, setReviewStale] = useState(false)
+
+  // Presence
+  const presence = usePresence()
+  const lastCursorBroadcast = useRef(0)
+  const throttledBroadcastCursor = (x: number, y: number, slideIndex: number | null) => {
+    const now = Date.now()
+    if (now - lastCursorBroadcast.current < 50) return
+    lastCursorBroadcast.current = now
+    presence.broadcastCursor(x, y, slideIndex)
+  }
+
+  // Register remote update handlers
+  useEffect(() => {
+    presence.onRemoteSlideUpdate.current = (slideIndex: number, html: string, _userId: string) => {
+      setCurrentHtml((prev) => {
+        const slides = parseSlides(prev)
+        if (slideIndex >= 0 && slideIndex < slides.length) {
+          slides[slideIndex] = html
+          return slides.join('')
+        }
+        return prev
+      })
+    }
+    presence.onRemoteContentUpdate.current = (html: string, _message: string) => {
+      setCurrentHtml(html)
+      setEditContent(html)
+    }
+    return () => {
+      presence.onRemoteSlideUpdate.current = null
+      presence.onRemoteContentUpdate.current = null
+    }
+  }, [presence])
 
   const exportPdf = async () => {
     if (!currentHtml) return
@@ -836,6 +940,7 @@ export default function SessionPage() {
         <div className="px-4 py-3 border-b border-slate-200 bg-white flex items-center justify-between">
           <div className="flex items-center gap-2">
             <p className="text-sm font-semibold text-slate-700">Output</p>
+            <PresenceDots users={presence.users} myUserId={presence.myIdentity.userId} />
             {currentReview && !reviewStale && (
               <VerdictBadge verdict={currentReview.verdict} />
             )}
@@ -872,34 +977,6 @@ export default function SessionPage() {
                 {exporting ? 'Exporting…' : 'Export PDF'}
               </button>
             )}
-            {currentHtml && (
-              <button
-                onClick={() => {
-                  setExportingJson(true)
-                  try {
-                    const payload = {
-                      html_content: currentHtml,
-                      review_report: currentReview,
-                      prompt: versions[activeVersionIdx ?? versions.length - 1]?.prompt ?? '',
-                      exported_at: new Date().toISOString(),
-                    }
-                    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
-                    const url = URL.createObjectURL(blob)
-                    const a = document.createElement('a')
-                    a.href = url
-                    a.download = `slides-export-${Date.now()}.json`
-                    a.click()
-                    URL.revokeObjectURL(url)
-                  } finally {
-                    setExportingJson(false)
-                  }
-                }}
-                disabled={exportingJson}
-                className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-50 transition-colors disabled:opacity-50"
-              >
-                Export JSON
-              </button>
-            )}
             {viewMode === 'edit' && (
               <button
                 onClick={() => setViewMode('preview')}
@@ -924,29 +1001,62 @@ export default function SessionPage() {
               <div className="flex-1 overflow-hidden flex flex-row">
                 <div className="flex-1 overflow-hidden" ref={outputPaneRef}>
                   {viewMode === 'preview' && (
-                    <div className="w-full h-full overflow-y-auto bg-slate-200">
+                    <div
+                      className="w-full h-full overflow-y-auto bg-slate-200 relative"
+                      onMouseMove={(e) => {
+                        const rect = e.currentTarget.getBoundingClientRect()
+                        const x = (e.clientX - rect.left) / rect.width
+                        const y = (e.clientY - rect.top + e.currentTarget.scrollTop) / e.currentTarget.scrollHeight
+                        throttledBroadcastCursor(x, y, null)
+                      }}
+                      onMouseLeave={() => presence.broadcastCursor(-1, -1, null)}
+                    >
                       {parseSlides(currentHtml).map((slideHtml, i) => (
-                        <SlidePreview key={i} html={slideHtml} paneH={paneH} />
+                        <SlidePreview key={`${i}-${slideHtml.length}-${slideHtml.slice(0, 80)}`} html={slideHtml} paneH={paneH} />
                       ))}
+                      {Array.from(presence.cursors.entries()).map(([userId, cursor], idx) => {
+                        if (cursor.x < 0 || cursor.y < 0) return null
+                        return (
+                          <RemoteCursor
+                            key={userId}
+                            name={cursor.display_name}
+                            x={cursor.x}
+                            y={cursor.y}
+                            color={CURSOR_COLORS[idx % CURSOR_COLORS.length]}
+                          />
+                        )
+                      })}
                     </div>
                   )}
                   {viewMode === 'edit' && (
                     <div className="w-full h-full overflow-y-auto bg-slate-200">
-                      {parseSlides(currentHtml).map((slideHtml, i) => (
-                        <EditableSlide
-                          key={i}
-                          html={slideHtml}
-                          paneH={paneH}
-                          onSave={(updated) => {
-                            const all = parseSlides(currentHtml)
-                            const before = all.join('')
-                            all[i] = updated
-                            const after = all.join('')
-                            setCurrentHtml(after)
-                            if (after !== before && currentReview) setReviewStale(true)
-                          }}
-                        />
-                      ))}
+                      {parseSlides(currentHtml).map((slideHtml, i) => {
+                        const remoteEditor = presence.users.find(
+                          (u) => u.user_id !== presence.myIdentity.userId && u.editing_slide === i
+                        ) ?? null
+                        return (
+                          <EditableSlide
+                            key={`${i}-${slideHtml.length}-${slideHtml.slice(0, 80)}`}
+                            html={slideHtml}
+                            paneH={paneH}
+                            slideIndex={i}
+                            remoteEditor={remoteEditor}
+                            onFocusSlide={(idx) => presence.startEditing(idx)}
+                            onBlurSlide={() => presence.stopEditing()}
+                            onSave={(updated) => {
+                              const all = parseSlides(currentHtml)
+                              const before = all.join('')
+                              all[i] = updated
+                              const after = all.join('')
+                              setCurrentHtml(after)
+                              if (after !== before) {
+                                if (currentReview) setReviewStale(true)
+                                presence.broadcastSlideSave(i, updated)
+                              }
+                            }}
+                          />
+                        )
+                      })}
                     </div>
                   )}
                 </div>

@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from extensions import db, migrate
+from extensions import db, migrate, socketio
 
 
 def create_app():
@@ -28,6 +28,7 @@ def create_app():
     db.init_app(app)
     migrate.init_app(app, db)
     CORS(app)
+    socketio.init_app(app, cors_allowed_origins='*', async_mode='threading')
 
     from models import ChatSession, KnowledgeItem, DesignSystem, DesignSystemAsset, Message
     admin = Admin(app, name='ContentStudio', template_mode='bootstrap3')
@@ -41,6 +42,7 @@ def create_app():
     from routes.design_system import design_system_bp
     from routes.knowledge import knowledge_bp
     from routes.chat import chat_bp
+    import routes.presence  # noqa: F401 — registers Socket.IO event handlers
     app.register_blueprint(sessions_bp)
     app.register_blueprint(design_system_bp)
     app.register_blueprint(knowledge_bp)
@@ -60,4 +62,4 @@ def create_app():
 app = create_app()
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+    socketio.run(app, debug=True, port=5001)

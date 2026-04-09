@@ -1,6 +1,6 @@
 import re
 from flask import Blueprint, request, jsonify
-from extensions import db
+from extensions import db, socketio
 from models import Message, ChatSession, DesignSystem, DesignSystemAsset, KnowledgeItem, Claim
 from services.claude_service import (
     generate_content, chat_response, review_content, orchestrate,
@@ -304,5 +304,13 @@ def send_message(session_id):
     )
     db.session.add(assistant_msg)
     db.session.commit()
+
+    # Broadcast slide content update to other users in the session room
+    if html_content:
+        socketio.emit('presence:content_updated', {
+            'session_id': session_id,
+            'html': html_content,
+            'message': chat_text or 'Slides generated — check the output panel.',
+        }, room=f'session:{session_id}')
 
     return jsonify(assistant_msg.to_dict()), 201
