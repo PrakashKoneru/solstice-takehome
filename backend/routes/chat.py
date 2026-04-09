@@ -39,6 +39,125 @@ def restore_version(session_id):
     return jsonify(msg.to_dict()), 201
 
 
+_CLAIM_SPAN_RE = re.compile(
+    r'<span[^>]*data-claim-id="([^"]+)"[^>]*>(.*?)</span>',
+    re.DOTALL,
+)
+_TAG_RE = re.compile(r'<[^>]+>')
+_WS_RE = re.compile(r'\s+')
+
+
+def _normalize_claim_text(s: str) -> str:
+    """Strip tags, decode common HTML entities, collapse whitespace."""
+    s = _TAG_RE.sub('', s)
+    s = (s.replace('&amp;', '&')
+           .replace('&lt;', '<')
+           .replace('&gt;', '>')
+           .replace('&quot;', '"')
+           .replace('&#39;', "'")
+           .replace('&nbsp;', ' '))
+    return _WS_RE.sub(' ', s).strip()
+
+
+def _detect_claim_drift(html: str, claims_by_id: dict) -> list:
+    """Walk the HTML for claim-locked spans and compare their text to the
+    authoritative claim catalog. Returns a list of drift flags."""
+    flags = []
+    seen = set()
+    for match in _CLAIM_SPAN_RE.finditer(html):
+        cid = match.group(1)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if cid not in claims_by_id:
+            flags.append({
+                'claim': cid,
+                'status': 'unsupported',
+                'note': f'Claim ID "{cid}" not found in approved catalog.',
+            })
+            continue
+        rendered = _normalize_claim_text(match.group(2))
+        expected = _normalize_claim_text(claims_by_id[cid].get('text', ''))
+        if rendered != expected:
+            flags.append({
+                'claim': cid,
+                'status': 'unsupported',
+                'note': (
+                    f'Rendered text diverged from approved claim. '
+                    f'Expected: "{expected[:120]}". Got: "{rendered[:120]}".'
+                ),
+            })
+    return flags
+
+
+@chat_bp.route('/api/sessions/<int:session_id>/review', methods=['POST'])
+def rerun_review(session_id):
+    """Recompute the compliance review for the current HTML without touching
+    the deck spec. Used by the frontend after manual edits to refresh the
+    verdict badge. The spec is resolved from the session's most recent
+    assistant message that has one attached."""
+    session = ChatSession.query.get_or_404(session_id)
+    data = request.get_json(force=True)
+    html = data.get('html') or ''
+    if not html:
+        return jsonify({'error': 'html required'}), 400
+
+    # Find the most recent spec in this session
+    prior_messages = (
+        Message.query.filter_by(session_id=session_id)
+        .order_by(Message.created_at.asc()).all()
+    )
+    prev_spec = None
+    for m in reversed(prior_messages):
+        rr = m.review_report
+        if rr and isinstance(rr, dict) and 'spec' in rr:
+            prev_spec = rr['spec']
+            break
+
+    if not prev_spec:
+        return jsonify({'error': 'no deck to review'}), 400
+
+    # Load claims from the session's selected docs
+    kb_doc_ids = session.selected_doc_ids or []
+    claims_by_id = {}
+    kb_texts = []
+    if kb_doc_ids:
+        claims = Claim.query.filter(
+            Claim.knowledge_id.in_(kb_doc_ids),
+            Claim.is_approved == True,
+        ).all()
+        claims_by_id = {c.to_dict()['id']: c.to_dict() for c in claims}
+
+        items = KnowledgeItem.query.filter(KnowledgeItem.id.in_(kb_doc_ids)).all()
+        kb_texts = [item.text_content for item in items if item.text_content]
+
+    # Build the baseline compliance trace from the spec
+    review_report = build_compliance_trace(prev_spec, claims_by_id)
+    review_report['spec'] = prev_spec
+
+    # HTML-drift detection: manual edits may have altered claim-locked text
+    # without updating the spec. Walk the HTML for data-claim-id spans and
+    # compare each to the authoritative claim catalog.
+    drift_flags = _detect_claim_drift(html, claims_by_id)
+    if drift_flags:
+        review_report['flags'] = drift_flags
+        review_report['verdict'] = 'flagged'
+        review_report['summary'] = (
+            f'{len(drift_flags)} claim(s) in the rendered HTML have been '
+            f'edited and no longer match the approved claim text.'
+        )
+        review_report['confidence'] = 0.5
+
+    # Optional soft checks against the current HTML
+    if kb_texts:
+        try:
+            review_report['soft_checks'] = review_content(html, kb_texts)
+        except Exception:
+            pass
+
+    return jsonify(review_report), 200
+
+
 @chat_bp.route('/api/sessions/<int:session_id>/messages', methods=['GET'])
 def list_messages(session_id):
     ChatSession.query.get_or_404(session_id)

@@ -284,6 +284,7 @@ function SessionPageInner() {
   const [currentHtml, setCurrentHtml] = useState('')
   const [currentReview, setCurrentReview] = useState<ReviewReport | null>(null)
   const [reviewOpen, setReviewOpen] = useState(false)
+  const [reviewRerunning, setReviewRerunning] = useState(false)
   const [viewMode, setViewMode] = useState<ViewMode>('preview')
   const [editContent, setEditContent] = useState('')
   const [versions, setVersions] = useState<Version[]>([])
@@ -562,6 +563,7 @@ function SessionPageInner() {
     let receivedHtml = ''
     let receivedReview: ReviewReport | null = null
     let chatText = ''
+    let serverMessage: Message | null = null
     let debounceTimer: ReturnType<typeof setTimeout> | null = null
 
     try {
@@ -601,8 +603,12 @@ function SessionPageInner() {
           onChat: (text) => {
             chatText = text
           },
-          onDone: () => {
-            // Final state updates handled below after promise resolves
+          onDone: (message) => {
+            // `message` is the server-committed Message row (including id
+            // and html_content). This is our confirmation that the server
+            // persisted the write — it's the only safe trigger for
+            // appending to the versions array.
+            serverMessage = message
           },
         },
         selectedDsId,
@@ -613,11 +619,20 @@ function SessionPageInner() {
       await promise
 
       setMessages((prev) => [...prev, { role: 'assistant', content: chatText || 'Slides generated — check the output panel.' }])
-      if (receivedHtml) {
-        const htmlChanged = receivedHtml !== currentHtml
+
+      // Only append a version if the server confirmed the write. The
+      // server-committed message is the source of truth for both the
+      // HTML body and the review report — never trust the local stream
+      // buffers for persistence decisions.
+      if (serverMessage && serverMessage.html_content) {
+        const htmlChanged = serverMessage.html_content !== currentHtml
         setViewMode('preview')
         if (htmlChanged) {
-          appendVersion(receivedHtml, userMessage, receivedReview)
+          appendVersion(
+            serverMessage.html_content,
+            userMessage,
+            serverMessage.review_report ?? null,
+          )
         }
       }
       if (isFirstMessage && activeSession) {
@@ -994,9 +1009,6 @@ function SessionPageInner() {
         <div className="px-4 py-3 border-b border-slate-200 bg-white flex items-center justify-between">
           <div className="flex items-center gap-2">
             <p className="text-sm font-semibold text-slate-700">Output</p>
-            {currentReview && !reviewStale && (
-              <VerdictBadge verdict={currentReview.verdict} />
-            )}
             {currentReview && reviewStale && (
               <span className="inline-flex items-center gap-1 rounded-full border border-yellow-200 bg-yellow-50 px-2 py-0.5 text-xs font-medium text-yellow-700">
                 <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1112,19 +1124,31 @@ function SessionPageInner() {
                                 if (manualEditSaveTimer.current) {
                                   clearTimeout(manualEditSaveTimer.current)
                                 }
-                                manualEditSaveTimer.current = setTimeout(() => {
+                                manualEditSaveTimer.current = setTimeout(async () => {
                                   const html = pendingManualEditHtml.current
                                   pendingManualEditHtml.current = null
                                   manualEditSaveTimer.current = null
                                   if (!html) return
-                                  api.chat
-                                    .restore(Number(id), html, currentReview, 'Manual edit')
-                                    .then((saved) => {
-                                      appendVersion(html, 'Manual edit', currentReview)
-                                    })
-                                    .catch((err) => {
-                                      console.error('Manual edit save failed:', err)
-                                    })
+                                  // 1. Rerun compliance review against the new HTML
+                                  //    so the saved message carries a fresh verdict.
+                                  let freshReview: ReviewReport | null = currentReview
+                                  setReviewRerunning(true)
+                                  try {
+                                    freshReview = await api.chat.rerunReview(Number(id), html)
+                                  } catch (err) {
+                                    console.error('Review rerun failed:', err)
+                                  }
+                                  // 2. Persist the manual edit + fresh review to DB
+                                  try {
+                                    await api.chat.restore(Number(id), html, freshReview, 'Manual edit')
+                                    setCurrentReview(freshReview)
+                                    setReviewStale(false)
+                                    appendVersion(html, 'Manual edit', freshReview)
+                                  } catch (err) {
+                                    console.error('Manual edit save failed:', err)
+                                  } finally {
+                                    setReviewRerunning(false)
+                                  }
                                 }, 1500)
                               }
                             }}
@@ -1175,12 +1199,7 @@ function SessionPageInner() {
                               setSelectedVersionIdx(null)
                               setRestoringIdx(idx)
 
-                              // Persist restore to DB so it survives refresh
-                              api.chat.restore(Number(id), v.html, v.review, v.prompt).then((saved) => {
-                                setMessages((prev) => [...prev, { role: 'assistant', content: saved.content }])
-                              }).catch(console.error)
-
-                              // Measure start Y of the restoring dot relative to trail container
+                              // Measure start Y of the restoring dot for ghost animation
                               const btn = dotRefs.current.get(idx)
                               const trail = versionTrailRef.current
                               const scroll = innerScrollRef.current
@@ -1196,15 +1215,25 @@ function SessionPageInner() {
                                 }, 20)
                               }
 
-                              setTimeout(() => {
+                              // Persist restore to DB first. ONLY update versions
+                              // once the server confirms. This keeps the UI trail
+                              // and DB in sync — the new entry is always an append,
+                              // never a mutation of existing state, so a refresh
+                              // will show the same shape the user sees.
+                              try {
+                                const saved = await api.chat.restore(Number(id), v.html, v.review, v.prompt)
+                                setMessages((prev) => [...prev, { role: 'assistant', content: saved.content }])
                                 setVersions((prev) => {
-                                  const next = [...prev.filter((_, i) => i !== idx), { ...prev[idx], prompt: 'Restored version' }]
+                                  const next = [...prev, { html: v.html, prompt: 'Restored version', review: v.review }]
                                   setActiveVersionIdx(next.length - 1)
                                   return next
                                 })
+                              } catch (err) {
+                                console.error('Restore failed:', err)
+                              } finally {
                                 setRestoringIdx(null)
                                 setGhostY(null)
-                              }, 480)
+                              }
                             }}
                             className="w-full rounded-lg bg-indigo-600 px-2 py-1.5 text-xs font-semibold text-white hover:bg-indigo-700 transition-colors"
                           >
@@ -1251,9 +1280,21 @@ function SessionPageInner() {
                       </svg>
                       Compliance Review
                     </span>
-                    <svg className={`h-3.5 w-3.5 transition-transform ${reviewOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
-                    </svg>
+                    <span className="flex items-center gap-2">
+                      {reviewRerunning ? (
+                        <span className="flex items-center gap-1 text-[11px] font-medium text-slate-400">
+                          <svg className="h-3 w-3 animate-spin" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <circle cx="12" cy="12" r="10" strokeWidth={3} strokeDasharray="40 20" />
+                          </svg>
+                          Rechecking…
+                        </span>
+                      ) : !reviewStale ? (
+                        <VerdictBadge verdict={currentReview.verdict} />
+                      ) : null}
+                      <svg className={`h-3.5 w-3.5 transition-transform ${reviewOpen ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                      </svg>
+                    </span>
                   </button>
 
                   {reviewOpen && (

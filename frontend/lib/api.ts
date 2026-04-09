@@ -212,6 +212,11 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ html_content: htmlContent, review_report: reviewReport, original_prompt: originalPrompt ?? '' }),
       }),
+    rerunReview: (sessionId: number, html: string) =>
+      request<ReviewReport>(`/api/sessions/${sessionId}/review`, {
+        method: 'POST',
+        body: JSON.stringify({ html }),
+      }),
     export: (sessionId: number, msgId: number) =>
       request<{ html_content: string; review_report: ReviewReport | null; prompt: string; generated_at: string }>(
         `/api/sessions/${sessionId}/messages/${msgId}/export`
@@ -247,7 +252,7 @@ export const api = {
         onHtmlComplete?: (html: string) => void
         onReview?: (report: ReviewReport) => void
         onChat?: (text: string) => void
-        onDone?: (message: Message) => void
+        onDone?: (message: Message | null) => void
       },
       dsId?: number | '',
       kbDocIds?: number[],
@@ -315,7 +320,10 @@ export const api = {
                 callbacks.onChat?.(parsed.text)
                 break
               case 'done':
-                callbacks.onDone?.(parsed.message)
+                // Only pass through the message if the server actually
+                // committed one (generate/edit success paths). Error
+                // paths emit a bare `done` event with no message key.
+                callbacks.onDone?.(parsed.message ?? null)
                 break
             }
           }
