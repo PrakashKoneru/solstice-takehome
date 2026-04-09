@@ -336,6 +336,13 @@ Respond with ONLY valid JSON — no explanation:
 {"ops": ["chat"]} or {"ops": ["generate"]} or {"ops": ["edit"]}"""
 
 
+_RESET_PHRASES = (
+    'start over', 'from scratch', 'throw this out', 'scrap this',
+    'rebuild', 'new deck', 'redo the deck', 'redo the whole deck',
+    'discard', 'wipe', 'clear the deck',
+)
+
+
 def orchestrate(prompt: str, history: list, has_kb: bool, has_deck: bool = False) -> list:
     """Returns list of operations to run: one of ['generate'], ['edit'], or ['chat']"""
     client = _get_client()
@@ -349,9 +356,21 @@ def orchestrate(prompt: str, history: list, has_kb: bool, has_deck: bool = False
         )
         raw = _parse_json_response(msg.content[0].text)
         result = json.loads(raw)
-        return result.get('ops', ['chat'])
+        ops = result.get('ops', ['chat'])
     except Exception:
-        return ['chat']
+        ops = ['chat']
+
+    # Deterministic guard: when a deck already exists, only explicit reset
+    # phrases should route to generate. Otherwise, a generate verdict from
+    # the LLM (e.g. triggered by "create slide 3") is forcibly converted to
+    # edit so the existing deck is never silently wiped.
+    if has_deck and 'generate' in ops:
+        p = (prompt or '').lower()
+        if not any(phrase in p for phrase in _RESET_PHRASES):
+            print(f"[ORCHESTRATE] overriding generate → edit (has_deck=true, no reset phrase)")
+            ops = ['edit']
+
+    return ops
 
 
 def chat_response(
