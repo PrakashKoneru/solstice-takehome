@@ -18,9 +18,21 @@ AI-powered slide deck creation for HCP audiences, built for FRUZAQLA. Multi-agen
 ### 1. Clone the repo
 
 ```bash
-git clone <your-repo-url>
-cd SolisticeH
+git clone https://github.com/PrakashKoneru/solstice-takehome.git
+cd solstice-takehome
 ```
+
+You'll end up with this layout:
+
+```
+solstice-takehome/
+├── backend/      # Flask API + SocketIO + SQLAlchemy
+├── frontend/     # Next.js 16 app
+├── README.md
+└── ... (PDFs, etc.)
+```
+
+All subsequent commands assume you're at the repo root unless a `cd backend` or `cd frontend` is shown.
 
 ### 2. Backend
 
@@ -33,16 +45,18 @@ pip install -r requirements.txt
 
 > `pymupdf` is already pinned in `requirements.txt` — no extra install needed.
 
-Create a `.env` file in `backend/` (you can copy `backend/.env.example`):
+Create a `.env` file in `backend/` and paste in the block below. **You must populate `ANTHROPIC_API_KEY` with your own key** — everything else can be left as-is for local development.
 
 ```
-ANTHROPIC_API_KEY=your_key_here
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/solstice
-SECRET_KEY=any-random-string
+ANTHROPIC_API_KEY=
 FLASK_APP=app.py
 FLASK_ENV=development
 UPLOAD_FOLDER=uploads
+CLOUDINARY_URL=cloudinary://888649268748727:BA2t5tfc0Ri3NjZWqimGuiQ6WSg@dp73d6vju
 ```
+
+> Get an Anthropic API key from [console.anthropic.com](https://console.anthropic.com/). The `CLOUDINARY_URL` above is a shared dev account for asset uploads — replace it with your own if you're deploying this beyond local testing.
 
 Create the database and run migrations:
 

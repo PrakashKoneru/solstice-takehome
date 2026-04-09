@@ -405,38 +405,84 @@ function SessionPageInner() {
       const html2canvas = (await import('html2canvas')).default
       const pdf = new jsPDF({ orientation: 'landscape', unit: 'px', format: [1024, 576] })
 
-      // Parse slides from raw HTML — avoids any scale transforms in the preview
+      // Wait for all fonts in the document to finish loading so text
+      // doesn't render with fallback fonts in the captured canvas.
+      if ((document as any).fonts?.ready) {
+        await (document as any).fonts.ready
+      }
+
+      // Render every slide fresh into a visible (but parked) off-screen
+      // container at exact 1024×576, inside the live document so the CSS
+      // cascade (fonts, resets, inherited styles) still applies.
       const parser = new DOMParser()
       const doc = parser.parseFromString(currentHtml, 'text/html')
       const slideEls = Array.from(doc.querySelectorAll('[data-slide]'))
       if (!slideEls.length) return
 
-      // Off-screen container at exact slide dimensions, no transforms
-      const container = document.createElement('div')
-      container.style.cssText = 'position:fixed;left:-9999px;top:0;width:1024px;height:576px;overflow:hidden;'
-      document.body.appendChild(container)
+      // Put the capture host at position:absolute, top:0, left:-9999 so it
+      // participates in layout normally but isn't visible. position:fixed
+      // removes it from the flow and breaks some CSS expectations.
+      const host = document.createElement('div')
+      host.style.cssText = [
+        'position:absolute',
+        'top:0',
+        'left:-10000px',
+        'width:1024px',
+        'height:576px',
+        'background:#ffffff',
+        'overflow:hidden',
+        'z-index:-1',
+      ].join(';')
+      document.body.appendChild(host)
 
-      for (let i = 0; i < slideEls.length; i++) {
-        container.innerHTML = slideEls[i].outerHTML
-        // Wait for images to load
-        await Promise.all(
-          Array.from(container.querySelectorAll('img')).map(
-            img => img.complete ? Promise.resolve() : new Promise(r => { img.onload = r; img.onerror = r })
+      try {
+        for (let i = 0; i < slideEls.length; i++) {
+          host.innerHTML = ''
+          // Clone deeply so any nested <style> tags travel with the slide
+          const clone = slideEls[i].cloneNode(true) as HTMLElement
+          // Force the slide to its native dimensions regardless of any CSS
+          clone.style.width = '1024px'
+          clone.style.height = '576px'
+          clone.style.minWidth = '1024px'
+          clone.style.minHeight = '576px'
+          clone.style.maxWidth = '1024px'
+          clone.style.maxHeight = '576px'
+          clone.style.position = 'relative'
+          clone.style.display = 'block'
+          clone.style.boxSizing = 'border-box'
+          clone.style.overflow = 'hidden'
+          clone.style.transform = 'none'
+          host.appendChild(clone)
+
+          // Let the browser lay out + wait for images
+          await new Promise((r) => requestAnimationFrame(() => r(null)))
+          await Promise.all(
+            Array.from(host.querySelectorAll('img')).map((img) =>
+              img.complete
+                ? Promise.resolve()
+                : new Promise((r) => { img.onload = r; img.onerror = r })
+            )
           )
-        )
-        const canvas = await html2canvas(container.firstElementChild as HTMLElement, {
-          scale: 2,
-          useCORS: true,
-          allowTaint: true,
-          backgroundColor: '#ffffff',
-          width: 1024,
-          height: 576,
-        })
-        if (i > 0) pdf.addPage([1024, 576], 'landscape')
-        pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, 1024, 576)
+
+          const canvas = await html2canvas(clone, {
+            scale: 2,
+            useCORS: true,
+            allowTaint: true,
+            backgroundColor: '#ffffff',
+            width: 1024,
+            height: 576,
+            windowWidth: 1024,
+            windowHeight: 576,
+            scrollX: 0,
+            scrollY: 0,
+          })
+          if (i > 0) pdf.addPage([1024, 576], 'landscape')
+          pdf.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, 1024, 576)
+        }
+      } finally {
+        document.body.removeChild(host)
       }
 
-      document.body.removeChild(container)
       pdf.save('slides.pdf')
     } finally {
       setExporting(false)
