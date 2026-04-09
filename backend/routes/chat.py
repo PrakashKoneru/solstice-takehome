@@ -119,13 +119,6 @@ def send_message(session_id):
         items = KnowledgeItem.query.filter(KnowledgeItem.id.in_(kb_doc_ids)).all()
         kb_texts = [item.text_content for item in items if item.text_content]
 
-    # ── Orchestrator ──────────────────────────────────────────────────────────
-    ops = orchestrate(prompt, slim_history, has_kb=bool(kb_texts))
-
-    html_content  = None
-    review_report = None
-    chat_text     = None
-
     # Retrieve previous spec and HTML from last generation (if any)
     prev_spec = None
     prev_html = None
@@ -136,8 +129,116 @@ def send_message(session_id):
             prev_html = m.html_content
             break
 
+    # ── Orchestrator ──────────────────────────────────────────────────────────
+    ops = orchestrate(prompt, slim_history, has_kb=bool(kb_texts), has_deck=bool(prev_spec))
+
+    html_content  = None
+    review_report = None
+    chat_text     = None
+
+    # Helper: shared finalization pipeline (ISI injection → validation → render → compliance)
+    def _finalize_spec(spec, claims_by_id, claims_list, is_edit=False):
+        nonlocal html_content, review_report, chat_text
+
+        errors = validate_slide_spec(spec, list(claims_by_id.keys()), brand_guidelines)
+        if errors:
+            print(f"[DEBUG] Validation errors: {errors}")
+            retry_spec = generate_slide_spec(
+                prompt + f"\n\nFix these validation errors: {'; '.join(errors)}",
+                claims_list, brand_guidelines,
+                target_audience, audience_rules, slim_history,
+                component_patterns=component_patterns,
+            )
+            retry_errors = validate_slide_spec(retry_spec, list(claims_by_id.keys()), brand_guidelines)
+            if retry_errors:
+                chat_text = f"Could not generate compliant slides: {'; '.join(retry_errors)}"
+                return
+            spec = retry_spec
+
+        # Auto-inject most relevant ISI claim into clinical slides missing one
+        isi_claims = {cid: c for cid, c in claims_by_id.items() if c.get('claim_type') == 'isi'}
+        if isi_claims:
+            clinical = {'big_stat', 'stat_row', 'two_column', 'three_column_cards',
+                        'comparison_table', 'data_table', 'subgroup_forest'}
+            for slide in spec.get('slides', []):
+                if slide.get('layout') in clinical:
+                    footer_ids = {fc.get('claim_id') for fc in slide.get('footer_claims', [])}
+                    if not any(cid in footer_ids for cid in isi_claims):
+                        slide_cids = []
+                        h = slide.get('headline', {}).get('claim_id')
+                        if h:
+                            slide_cids.append(h)
+                        slide_cids += [b['claim_id'] for b in slide.get('body_claims', []) if b.get('claim_id')]
+                        slide_tags = set()
+                        for cid in slide_cids:
+                            slide_tags.update(t.lower() for t in (claims_by_id.get(cid, {}).get('tags') or []))
+
+                        def isi_relevance(isi_id):
+                            isi_tags = set(t.lower() for t in (isi_claims[isi_id].get('tags') or []))
+                            return len(isi_tags & slide_tags)
+
+                        best_isi = max(isi_claims.keys(), key=isi_relevance)
+                        slide.setdefault('footer_claims', []).append({'claim_id': best_isi})
+
+        # Render HTML
+        try:
+            html_content = render_spec_to_html(
+                spec, claims_by_id, design_tokens,
+                brand_guidelines, ds_assets,
+                current_html=prev_html if is_edit else None,
+                component_patterns=component_patterns,
+            )
+        except Exception as e:
+            print(f"[DEBUG] render_spec_to_html FAILED: {e}")
+            html_content = render_deck(
+                spec, claims_by_id, design_tokens, brand_guidelines, ds_assets,
+            )
+        review_report = build_compliance_trace(spec, claims_by_id)
+        review_report['spec'] = spec
+        if kb_texts:
+            try:
+                soft = review_content(html_content, kb_texts)
+                review_report['soft_checks'] = soft
+            except Exception:
+                pass
+
+    # ── Edit path ─────────────────────────────────────────────────────────────
+    if 'edit' in ops:
+        if not prev_spec:
+            chat_text = "There's no existing deck to edit yet. Try asking me to generate a new deck first."
+        else:
+            if kb_doc_ids:
+                claims = Claim.query.filter(
+                    Claim.knowledge_id.in_(kb_doc_ids),
+                    Claim.is_approved == True,
+                ).all()
+                claims_list = [c.to_dict() for c in claims]
+                if not claims_list:
+                    chat_text = (
+                        "No approved claims found in the selected documents. "
+                        "Please review and approve claims on the Knowledge Base page before generating."
+                    )
+                else:
+                    claims_by_id = {c['id']: c for c in claims_list}
+                    try:
+                        spec = edit_slide_spec(
+                            prompt, prev_spec, claims_list, slim_history,
+                            brand_guidelines=brand_guidelines,
+                        )
+                        spec_changed = (spec != prev_spec)
+                        print(f"[DEBUG] edit_slide_spec: spec_changed={spec_changed}")
+                        if not spec_changed and prev_html:
+                            print(f"[DEBUG] spec unchanged after edit, reusing previous HTML")
+                            html_content = prev_html
+                            review_report = build_compliance_trace(spec, claims_by_id)
+                            review_report['spec'] = spec
+                        else:
+                            _finalize_spec(spec, claims_by_id, claims_list, is_edit=True)
+                    except Exception as e:
+                        chat_text = f"Slide edit failed: {e}"
+
     # ── Generation path (structured, claims-constrained) ──────────────────────
-    if 'generate' in ops:
+    elif 'generate' in ops:
         if kb_doc_ids:
             claims = Claim.query.filter(
                 Claim.knowledge_id.in_(kb_doc_ids),
@@ -153,88 +254,13 @@ def send_message(session_id):
             else:
                 claims_by_id = {c['id']: c for c in claims_list}
                 try:
-                    if prev_spec:
-                        # Targeted edit path
-                        spec = edit_slide_spec(
-                            prompt, prev_spec, claims_list, slim_history,
-                        )
-                        spec_changed = (spec != prev_spec)
-                        print(f"[DEBUG] edit_slide_spec: spec_changed={spec_changed}")
-                    else:
-                        # Fresh generation path
-                        print(f"[DEBUG] Using generate_slide_spec path (no prev_spec)")
-                        spec = generate_slide_spec(
-                            prompt, claims_list, brand_guidelines,
-                            target_audience, audience_rules, slim_history,
-                        )
-                    errors = validate_slide_spec(spec, list(claims_by_id.keys()), brand_guidelines)
-                    if errors:
-                        print(f"[DEBUG] Validation errors after edit: {errors}")
-                        # Retry as fresh generation with errors as feedback
-                        spec = generate_slide_spec(
-                            prompt + f"\n\nFix these validation errors: {'; '.join(errors)}",
-                            claims_list, brand_guidelines,
-                            target_audience, audience_rules, slim_history,
-                        )
-                        errors = validate_slide_spec(spec, list(claims_by_id.keys()), brand_guidelines)
-
-                    if errors:
-                        chat_text = f"Could not generate compliant slides: {'; '.join(errors)}"
-                    else:
-                        # Auto-inject most relevant ISI claim into clinical slides missing one
-                        isi_claims = {cid: c for cid, c in claims_by_id.items() if c.get('claim_type') == 'isi'}
-                        if isi_claims:
-                            clinical = {'big_stat', 'stat_row', 'two_column', 'three_column_cards',
-                                        'comparison_table', 'data_table', 'subgroup_forest'}
-                            for slide in spec.get('slides', []):
-                                if slide.get('layout') in clinical:
-                                    footer_ids = {fc.get('claim_id') for fc in slide.get('footer_claims', [])}
-                                    if not any(cid in footer_ids for cid in isi_claims):
-                                        # Collect tags from all claims referenced on this slide
-                                        slide_cids = []
-                                        h = slide.get('headline', {}).get('claim_id')
-                                        if h:
-                                            slide_cids.append(h)
-                                        slide_cids += [b['claim_id'] for b in slide.get('body_claims', []) if b.get('claim_id')]
-                                        slide_tags = set()
-                                        for cid in slide_cids:
-                                            slide_tags.update(t.lower() for t in (claims_by_id.get(cid, {}).get('tags') or []))
-
-                                        # Score each ISI by tag overlap with slide content
-                                        def isi_relevance(isi_id):
-                                            isi_tags = set(t.lower() for t in (isi_claims[isi_id].get('tags') or []))
-                                            return len(isi_tags & slide_tags)
-
-                                        best_isi = max(isi_claims.keys(), key=isi_relevance)
-                                        slide.setdefault('footer_claims', []).append({'claim_id': best_isi})
-
-                        # Render HTML — reuse previous if spec unchanged
-                        is_edit = prev_spec is not None
-                        if is_edit and spec == prev_spec and prev_html:
-                            print(f"[DEBUG] spec unchanged after edit, reusing previous HTML")
-                            html_content = prev_html
-                        else:
-                            try:
-                                html_content = render_spec_to_html(
-                                    spec, claims_by_id, design_tokens,
-                                    brand_guidelines, ds_assets,
-                                    current_html=prev_html if is_edit else None,
-                                    component_patterns=component_patterns,
-                                )
-                            except Exception as e:
-                                print(f"[DEBUG] render_spec_to_html FAILED: {e}")
-                                html_content = render_deck(
-                                    spec, claims_by_id, design_tokens, brand_guidelines, ds_assets,
-                                )
-                        review_report = build_compliance_trace(spec, claims_by_id)
-                        review_report['spec'] = spec
-                        # Review Agent still runs as soft check
-                        if kb_texts:
-                            try:
-                                soft = review_content(html_content, kb_texts)
-                                review_report['soft_checks'] = soft
-                            except Exception:
-                                pass
+                    print(f"[DEBUG] Using generate_slide_spec path (fresh generation)")
+                    spec = generate_slide_spec(
+                        prompt, claims_list, brand_guidelines,
+                        target_audience, audience_rules, slim_history,
+                        component_patterns=component_patterns,
+                    )
+                    _finalize_spec(spec, claims_by_id, claims_list, is_edit=False)
                 except Exception as e:
                     chat_text = f"Slide generation failed: {e}"
 

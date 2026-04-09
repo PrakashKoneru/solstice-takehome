@@ -314,32 +314,37 @@ CONTENT RULES:
 - Every claim must be traceable to KB."""
 
 
-ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator for a pharma content studio. Your job is to read the user's message and conversation history, then decide which operations to run for this turn.
+ORCHESTRATOR_SYSTEM_PROMPT = """You are the orchestrator for a pharma content studio. Your job is to read the user's message and conversation history, then decide which operation to run for this turn.
 
 Available operations:
-- "generate"  — run the slide content agent (creates/edits/reorders slides)
-- "chat"      — run the conversational agent (answers questions, guides the user, explains what was done)
+- "edit"      — modify specific aspects of an existing deck (change headlines, swap claims, add/remove slides, change layouts)
+- "generate"  — create a brand-new deck from scratch
+- "chat"      — answer questions, guide the user, explain what was done
 
-Rules:
-- If the user uses ANY word indicating slide creation, editing, or removal (create, build, generate, make, add, edit, update, reorder, move, fix, change, delete, remove, drop) AND has_kb is true → return ["generate"].
-- If the user is asking a question, planning, or exploring options (what, how, which, can you, tell me, show me, list) → return ["chat"].
-- If has_kb is false and the user wants to generate → return ["chat"] only.
-- When unsure → return ["chat"].
-- Never return ["generate", "chat"] together — generation and chat are separate turns.
+Classification rules (apply in order):
+1. If has_kb is false → return ["chat"] regardless of intent.
+2. If the user explicitly wants a fresh start ("build me a deck", "start over", "rebuild from scratch", "create new slides", "new deck", "generate a deck") → return ["generate"].
+3. If has_deck is true AND the user references modifying specific aspects of existing slides ("change slide 3 headline", "swap the claim", "add a slide about dosing", "remove slide 2", "update the title", "move slide 4", "edit the layout") → return ["edit"].
+4. If the user wants slides but has_deck is false → return ["generate"].
+5. Questions, exploration, or ambiguous requests → return ["chat"].
+6. When unsure → return ["chat"].
+
+Never return more than one operation.
 
 Respond with ONLY valid JSON — no explanation:
-{"ops": ["chat"]} or {"ops": ["generate"]}"""
+{"ops": ["chat"]} or {"ops": ["generate"]} or {"ops": ["edit"]}"""
 
 
-def orchestrate(prompt: str, history: list, has_kb: bool) -> list:
-    """Returns list of operations to run: subset of ['generate', 'review', 'chat']"""
+def orchestrate(prompt: str, history: list, has_kb: bool, has_deck: bool = False) -> list:
+    """Returns list of operations to run: one of ['generate'], ['edit'], or ['chat']"""
     client = _get_client()
     try:
+        context = f"has_kb: {str(has_kb).lower()}\nhas_deck: {str(has_deck).lower()}\n\nUser message: {prompt}"
         msg = client.messages.create(
             model='claude-haiku-4-5-20251001',
             max_tokens=256,
             system=ORCHESTRATOR_SYSTEM_PROMPT,
-            messages=history + [{'role': 'user', 'content': f'has_kb: {str(has_kb).lower()}\n\nUser message: {prompt}'}],
+            messages=history + [{'role': 'user', 'content': context}],
         )
         raw = _parse_json_response(msg.content[0].text)
         result = json.loads(raw)
@@ -957,7 +962,8 @@ EDIT_SPEC_TOOL = {
                         "action": {
                             "type": "string",
                             "enum": ["replace_headline", "replace_body_claim", "add_body_claim",
-                                     "remove_body_claim", "change_layout", "change_title"]
+                                     "remove_body_claim", "change_layout", "change_title",
+                                     "add_slide", "remove_slide"]
                         },
                         "body_claim_index": {
                             "type": "integer",
@@ -983,6 +989,37 @@ EDIT_SPEC_TOOL = {
                         "new_title": {
                             "type": "string",
                             "description": "New slide_title text (no numbers/percentages)"
+                        },
+                        "new_slide": {
+                            "type": "object",
+                            "description": "Full slide object for add_slide action",
+                            "properties": {
+                                "layout": {"type": "string"},
+                                "slide_title": {"type": "string"},
+                                "headline": {"type": "object", "properties": {"claim_id": {"type": "string"}}},
+                                "body_claims": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "claim_id": {"type": "string"},
+                                            "role": {"type": "string"}
+                                        }
+                                    }
+                                },
+                                "footer_claims": {
+                                    "type": "array",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {"claim_id": {"type": "string"}}
+                                    }
+                                }
+                            },
+                            "required": ["layout", "slide_title", "headline", "body_claims"]
+                        },
+                        "insert_after": {
+                            "type": "integer",
+                            "description": "0-based index to insert after (-1 for beginning). Used with add_slide."
                         }
                     },
                     "required": ["slide_index", "action"]
@@ -993,7 +1030,7 @@ EDIT_SPEC_TOOL = {
     }
 }
 
-EDIT_SPEC_SYSTEM_PROMPT = """You are a slide spec editor. You receive a <current_spec> (the existing slide deck) and a <claim_catalog> of available claims. The user describes a targeted change. Return ONLY the minimal edits needed.
+EDIT_SPEC_SYSTEM_PROMPT = """You are a slide spec editor. You receive a <current_spec> (the existing slide deck), a <claim_catalog> of available claims, and optionally <brand_guidelines> for layout/styling decisions. The user describes a targeted change. Return ONLY the minimal edits needed.
 
 Actions:
 - replace_headline: swap the headline claim_id on a slide
@@ -1002,11 +1039,15 @@ Actions:
 - remove_body_claim: remove a body_claim by index
 - change_layout: change a slide's layout type
 - change_title: change a slide's slide_title text
+- add_slide: insert a new slide. Provide new_slide (full slide object with layout, slide_title, headline, body_claims, footer_claims) and insert_after (0-based index; -1 for beginning). Set slide_index to 0 (ignored for add_slide).
+- remove_slide: delete a slide at slide_index
 
 Rules:
 - Only return edits for what the user asked to change. Do NOT re-specify unchanged slides.
 - Match the user's intent to the closest available claim in the catalog.
-- For replace actions, set new_claim_id to the best matching claim from the catalog."""
+- For replace actions, set new_claim_id to the best matching claim from the catalog.
+- When adding slides, choose a layout that fits the claims and respects brand guidelines if provided.
+- Claim IDs in new_slide must come from the claim catalog."""
 
 
 def edit_slide_spec(
@@ -1014,6 +1055,7 @@ def edit_slide_spec(
     current_spec: dict,
     claims: list,
     history: Optional[list] = None,
+    brand_guidelines: Optional[dict] = None,
 ) -> dict:
     """
     Apply targeted edits to an existing spec. Returns the modified spec.
@@ -1048,9 +1090,14 @@ def edit_slide_spec(
     # Inject enum into new_claim_id
     tool['input_schema']['properties']['edits']['items']['properties']['new_claim_id']['enum'] = claim_id_enum
 
+    brand_block = ""
+    if brand_guidelines:
+        brand_block = f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>\n\n"
+
     user_content = (
         f"<current_spec>\n{json.dumps(resolved_spec, indent=2)}\n</current_spec>\n\n"
         f"<claim_catalog>\n{json.dumps(catalog, indent=2)}\n</claim_catalog>\n\n"
+        f"{brand_block}"
         f"{prompt}"
     )
 
@@ -1081,7 +1128,21 @@ def edit_slide_spec(
     print(f"[DEBUG] prev spec before edits: {json.dumps(spec, indent=2)}")
     slides = spec.get('slides', [])
 
+    # Separate structural edits (add/remove slide) from per-slide edits
+    per_slide_edits = []
+    removes = []
+    adds = []
     for edit in edits:
+        action = edit['action']
+        if action == 'remove_slide':
+            removes.append(edit)
+        elif action == 'add_slide':
+            adds.append(edit)
+        else:
+            per_slide_edits.append(edit)
+
+    # Pass 1: apply per-slide edits (before structural changes shift indices)
+    for edit in per_slide_edits:
         idx = edit['slide_index']
         if idx < 0 or idx >= len(slides):
             continue
@@ -1111,44 +1172,249 @@ def edit_slide_spec(
         elif action == 'change_title' and edit.get('new_title'):
             slide['slide_title'] = edit['new_title']
 
+    # Pass 2: remove slides in reverse index order to avoid shifting
+    for edit in sorted(removes, key=lambda e: e['slide_index'], reverse=True):
+        idx = edit['slide_index']
+        if 0 <= idx < len(slides):
+            slides.pop(idx)
+
+    # Pass 3: insert new slides in forward order
+    for edit in sorted(adds, key=lambda e: e.get('insert_after', len(slides))):
+        new_slide = edit.get('new_slide')
+        if not new_slide:
+            continue
+        insert_after = edit.get('insert_after', len(slides) - 1)
+        insert_pos = insert_after + 1 if insert_after >= 0 else 0
+        insert_pos = min(insert_pos, len(slides))
+        slides.insert(insert_pos, new_slide)
+
     print(f"[DEBUG] spec after edits applied: {json.dumps(spec, indent=2)}")
     return spec
 
 
-def generate_slide_spec(
-    prompt: str,
-    claims: list,
-    brand_guidelines: Optional[dict] = None,
-    target_audience: Optional[str] = None,
-    audience_rules: Optional[dict] = None,
-    history: Optional[list] = None,
-    current_spec: Optional[dict] = None,
-) -> dict:
-    """
-    Generate a structured slide spec using approved claims as an enum constraint.
-    Returns the parsed slide spec dict.
-    """
+# ── Incremental per-slide generation pipeline ─────────────────────────────────
+
+NARRATIVE_PLAN_TOOL = {
+    "name": "plan_narrative",
+    "description": "Plan the narrative arc of the slide deck by listing slide topics.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "slides": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "topic": {
+                            "type": "string",
+                            "description": "Short description of the slide's intent"
+                        },
+                        "claim_types": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Which claim types are relevant (efficacy, safety, dosing, isi, etc.)"
+                        },
+                        "keywords": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Key terms for claim filtering (e.g. 'OS', 'PFS', 'adverse events')"
+                        }
+                    },
+                    "required": ["topic", "claim_types", "keywords"]
+                }
+            }
+        },
+        "required": ["slides"]
+    }
+}
+
+SELECT_CLAIMS_TOOL = {
+    "name": "select_claims",
+    "description": "Select the most relevant claims for a single slide topic.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "selected": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "claim_id": {"type": "string"},
+                        "role": {
+                            "type": "string",
+                            "enum": ["headline", "supporting", "comparison", "context", "subgroup", "footer"]
+                        }
+                    },
+                    "required": ["claim_id", "role"]
+                }
+            }
+        },
+        "required": ["selected"]
+    }
+}
+
+BUILD_SLIDE_TOOL = {
+    "name": "build_slide",
+    "description": "Build a single slide: choose component/layout, wire claims, write title.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "layout": {
+                "type": "string",
+                "enum": [
+                    "hero", "big_stat", "stat_row", "two_column",
+                    "three_column_cards", "comparison_table",
+                    "data_table", "subgroup_forest", "title_only"
+                ]
+            },
+            "slide_title": {
+                "type": "string",
+                "description": (
+                    "Creative framing headline with NO numbers, NO percentages, "
+                    "NO comparative outcomes. Pure brand/context copy only."
+                )
+            },
+            "headline": {
+                "type": "object",
+                "properties": {
+                    "claim_id": {"type": "string"},
+                    "emphasis": {
+                        "type": "object",
+                        "properties": {
+                            "numeric_value_index": {"type": "integer"},
+                            "style": {
+                                "type": "string",
+                                "enum": ["hero_number", "bold", "color_accent"]
+                            }
+                        }
+                    }
+                },
+                "required": ["claim_id"]
+            },
+            "body_claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "claim_id": {"type": "string"},
+                        "role": {
+                            "type": "string",
+                            "enum": ["supporting", "comparison", "context", "subgroup"]
+                        }
+                    },
+                    "required": ["claim_id", "role"]
+                }
+            },
+            "footer_claims": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "claim_id": {"type": "string"}
+                    },
+                    "required": ["claim_id"]
+                }
+            },
+            "cta_text": {
+                "type": "string",
+                "description": "Optional CTA button label. Short, no clinical data."
+            }
+        },
+        "required": ["layout", "slide_title", "headline"]
+    }
+}
+
+NARRATIVE_PLAN_SYSTEM = """You are a pharma slide deck narrative planner. Given the user's request, available claim types/tags, audience, and brand tone — produce an ordered list of slide topics that form a coherent narrative arc.
+
+Each topic is a short description of the slide's intent (e.g. "Overall survival primary endpoint", "Safety profile overview"). For each topic, specify which claim types are relevant and key terms for filtering claims.
+
+Guidelines:
+- Start with a hero/title slide if the request implies a full deck
+- Group related data logically (efficacy → safety → dosing)
+- Keep the deck focused — 4-8 slides for a typical request
+- Include ISI/safety information where clinically appropriate"""
+
+SELECT_CLAIMS_SYSTEM = """You are a strict claim selector for pharma slides. Given a slide topic and candidate claims, select ONLY the claims that are directly relevant to this specific slide topic. Err on the side of fewer, more relevant claims.
+
+Rules:
+- Select 1 claim for the "headline" role — the most impactful claim for this topic
+- Select 0-4 claims for supporting roles (supporting, comparison, context, subgroup)
+- Select ISI/boilerplate claims for the "footer" role when available and relevant
+- Do NOT select claims that are tangentially related — strict relevance only
+- Every selected claim must have a clear reason for being on THIS slide"""
+
+BUILD_SLIDE_SYSTEM = """You are a pharma slide builder. You receive a slide topic, a set of pre-selected claims (with assigned roles), brand guidelines, and component patterns.
+
+HARD CONSTRAINTS:
+- You MUST use EVERY claim from <selected_claims>. Never drop, skip, or omit any claim.
+- You may ONLY use claim_id values that appear in <selected_claims>. Never invent, guess, or placeholder a claim_id. Copy each claim_id string exactly as provided.
+- The layout must adapt to accommodate ALL the given claims, not the other way around.
+
+Your job in order:
+1. Read all claims from <selected_claims> and note their roles and numeric_values.
+2. Pick the layout that best presents ALL of these claims using the VWES decision tree below.
+3. Wire every claim into the output using its exact claim_id. Write a slide_title (no numbers/percentages). Set emphasis per the rules below.
+
+LAYOUT SELECTION — VWES decision tree (first match wins):
+
+You are optimizing for Visual Weight Equilibrium across 5 dimensions:
+  T (Type hierarchy): headline-to-body size ratio should feel 2.5×–3.5×. Layouts with one dominant element (big_stat, hero) score high.
+  C (Color weight): 25%–40% chroma coverage is ideal. Each color_accent emphasis adds ~5% chroma.
+  S (Spatial balance): visual mass should be centered ±10%. two_column must have roughly equal mass per side. big_stat is inherently centered.
+  H (White space): 30%–50% negative space. Fewer elements = more breathing room. big_stat scores highest, data_table lowest.
+  D (Data density): fewer distinct elements improve comprehension.
+
+STEP 1 — OVERRIDE LAYOUTS (check first, always win):
+  - Any body claim has role "subgroup" AND has 3+ numeric_values → subgroup_forest
+  - Any body claim has role "comparison" AND headline has 2+ numeric_values → comparison_table
+  - More than 5 non-footer claims → data_table (accommodates high density)
+
+STEP 2 — COUNT non-footer claims (headline counts as 1):
+  Total = 1 → big_stat IF headline has numeric_values, else two_column
+  Total = 2 → two_column (headline left, 1 supporting right)
+  Total = 3 → three_column_cards IF all 3 have the same role and similar numeric_values count
+               two_column IF roles differ
+  Total = 4 → stat_row (headline top, 3 metrics below)
+  Total = 5 → stat_row with 4 body claims
+  Total > 5 → data_table
+
+STEP 3 — SPATIAL BALANCE CHECK (S dimension, two_column only):
+  Left column = headline claim. Right column = body claims.
+  If right has only 1 claim with text under 80 chars and no numeric_values → switch to big_stat.
+  Never output two_column where one side is visually empty.
+
+STEP 4 — SPECIAL CASES:
+  - No clinical claims, deck opener → hero
+  - Section divider between topics → title_only
+
+SLIDE TITLE (the only text you write):
+- Must be a framing headline with ZERO numbers, ZERO percentages, ZERO comparative language
+- Good: "Proven Survival Benefit", "Manageable Safety Profile"
+- Bad: "34% reduction in OS risk"
+
+EMPHASIS — set after layout is decided:
+  big_stat: emphasis.style = "hero_number" on the numeric_value_index with the largest value
+  two_column, stat_row: emphasis.style = "bold" on headline numeric_value_index 0
+  three_column_cards: emphasis.style = "color_accent" on each card's key numeric_value_index
+  comparison_table, data_table, subgroup_forest: no emphasis (data speaks for itself)
+  footer claims: never set emphasis"""
+
+
+def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_rules, history):
+    """Step 0: Plan the narrative arc — produces ordered slide topics."""
     client = _get_client()
 
-    # Build compact catalog and filter to relevant claims
-    catalog = [
-        {
-            "id": c['id'],
-            "text": c['text'],
-            "type": c['claim_type'],
-            "tags": c.get('tags') or [],
-            "numeric_values": c.get('numeric_values') or [],
-        }
-        for c in claims
-    ]
-    catalog = _tag_filter(catalog, prompt)
+    # Build compact claim summary (types + tags only, not full text)
+    claim_summary = {}
+    for c in claims:
+        ctype = c.get('claim_type', 'unknown')
+        tags = c.get('tags') or []
+        claim_summary.setdefault(ctype, set()).update(t.lower() for t in tags)
+    # Convert sets to lists for JSON serialization
+    claim_summary = {k: sorted(v) for k, v in claim_summary.items()}
 
-    # Inject enum into a fresh copy of the tool schema
-    claim_id_enum = [c['id'] for c in catalog]
-    tool = _inject_enum(copy.deepcopy(SLIDE_SPEC_TOOL), claim_id_enum)
-
-    # Build system prompt context
     context_parts = []
+    context_parts.append(f"<available_claim_types>\n{json.dumps(claim_summary, indent=2)}\n</available_claim_types>")
     if brand_guidelines:
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
     if target_audience:
@@ -1158,33 +1424,218 @@ def generate_slide_spec(
             f"<audience_rules>\n{json.dumps({target_audience: audience_rules[target_audience]}, indent=2)}\n</audience_rules>"
         )
 
-    if current_spec:
-        context_parts.append(
-            f"<current_spec>\n{json.dumps(current_spec, indent=2)}\n</current_spec>"
-        )
-
-    user_content = (
-        "\n\n".join(context_parts)
-        + f"\n\n<claim_catalog>\n{json.dumps(catalog, indent=2)}\n</claim_catalog>"
-        + f"\n\n{prompt}"
-    )
-
+    user_content = "\n\n".join(context_parts) + f"\n\n{prompt}"
     messages = list(history or []) + [{'role': 'user', 'content': user_content}]
 
     response = client.messages.create(
-        model='claude-opus-4-6',
-        max_tokens=4096,
-        system=SPEC_SYSTEM_PROMPT,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": "generate_slide_deck"},
+        model='claude-haiku-4-5-20251001',
+        max_tokens=2048,
+        system=NARRATIVE_PLAN_SYSTEM,
+        tools=[NARRATIVE_PLAN_TOOL],
+        tool_choice={"type": "tool", "name": "plan_narrative"},
         messages=messages,
     )
 
     for block in response.content:
-        if block.type == 'tool_use' and block.name == 'generate_slide_deck':
+        if block.type == 'tool_use' and block.name == 'plan_narrative':
+            print(f"[DEBUG] Narrative plan: {json.dumps(block.input, indent=2)}")
             return block.input
 
-    raise ValueError("Model did not return a slide deck spec")
+    raise ValueError("Narrative planner did not return a plan")
+
+
+def _prefilter_claims(claims, slide_plan):
+    """Step 1a: Programmatic pre-filter — narrow claims by type and keyword overlap."""
+    target_types = set(t.lower() for t in slide_plan.get('claim_types', []))
+    keywords = set(k.lower() for k in slide_plan.get('keywords', []))
+
+    scored = []
+    for c in claims:
+        ctype = (c.get('claim_type') or '').lower()
+        tags = set(t.lower() for t in (c.get('tags') or []))
+
+        # Always include ISI/boilerplate claims
+        if ctype in ('isi', 'boilerplate'):
+            scored.append((c, 100))
+            continue
+
+        # Must match at least one target type (if types specified)
+        if target_types and ctype not in target_types:
+            continue
+
+        # Score by keyword overlap with tags + text keywords
+        text_tokens = set(re.sub(r'[^a-z0-9\s]', '', (c.get('text') or '').lower()).split())
+        tag_overlap = len(keywords & tags)
+        text_overlap = len(keywords & text_tokens)
+        score = tag_overlap * 3 + text_overlap  # tags weighted higher
+
+        if score > 0 or not keywords:
+            scored.append((c, score))
+
+    # Sort by score descending, take top 20
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return [c for c, _ in scored[:20]]
+
+
+def _select_claims(slide_topic, candidate_claims):
+    """Step 1b: LLM strict claim selection for a single slide topic."""
+    client = _get_client()
+
+    catalog = [
+        {
+            "id": c['id'],
+            "text": c['text'],
+            "type": c.get('claim_type', ''),
+            "tags": c.get('tags') or [],
+        }
+        for c in candidate_claims
+    ]
+
+    # Inject claim_id enum into tool
+    tool = copy.deepcopy(SELECT_CLAIMS_TOOL)
+    claim_ids = [c['id'] for c in catalog]
+    tool['input_schema']['properties']['selected']['items']['properties']['claim_id']['enum'] = claim_ids
+
+    user_content = (
+        f"<slide_topic>\n{slide_topic}\n</slide_topic>\n\n"
+        f"<candidate_claims>\n{json.dumps(catalog, indent=2)}\n</candidate_claims>"
+    )
+
+    response = client.messages.create(
+        model='claude-haiku-4-5-20251001',
+        max_tokens=1024,
+        system=SELECT_CLAIMS_SYSTEM,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "select_claims"},
+        messages=[{'role': 'user', 'content': user_content}],
+    )
+
+    for block in response.content:
+        if block.type == 'tool_use' and block.name == 'select_claims':
+            print(f"[DEBUG] Claims selected for '{slide_topic}': {json.dumps(block.input, indent=2)}")
+            return block.input.get('selected', [])
+
+    raise ValueError(f"Claim selector did not return selections for topic: {slide_topic}")
+
+
+def _build_slide(slide_topic, selected_claims, all_claims, brand_guidelines, component_patterns):
+    """Steps 2+3+4: Component selection → template → assembly for a single slide."""
+    client = _get_client()
+
+    # Build full claim data for selected claims
+    claims_by_id = {c['id']: c for c in all_claims}
+    selected_full = []
+    for sel in selected_claims:
+        cid = sel['claim_id']
+        claim = claims_by_id.get(cid)
+        if claim:
+            selected_full.append({
+                "claim_id": cid,
+                "role": sel['role'],
+                "text": claim['text'],
+                "type": claim.get('claim_type', ''),
+                "tags": claim.get('tags') or [],
+                "numeric_values": claim.get('numeric_values') or [],
+            })
+
+    # Guard: if no valid claims resolved, return a title_only slide with no claim refs
+    if not selected_full:
+        print(f"[DEBUG] No valid claims resolved for '{slide_topic}', returning title_only slide")
+        return {
+            "layout": "title_only",
+            "slide_title": slide_topic,
+        }
+
+    # Inject claim_id enum into tool
+    tool = copy.deepcopy(BUILD_SLIDE_TOOL)
+    claim_ids = [s['claim_id'] for s in selected_full]
+    print(f"[DEBUG] claim_ids for build_slide enum: {claim_ids}")
+    # Inject into headline
+    tool['input_schema']['properties']['headline']['properties']['claim_id']['enum'] = claim_ids
+    # Inject into body_claims
+    tool['input_schema']['properties']['body_claims']['items']['properties']['claim_id']['enum'] = claim_ids
+    # Inject into footer_claims
+    tool['input_schema']['properties']['footer_claims']['items']['properties']['claim_id']['enum'] = claim_ids
+
+    context_parts = [
+        f"<slide_topic>\n{slide_topic}\n</slide_topic>",
+        f"<selected_claims>\n{json.dumps(selected_full, indent=2)}\n</selected_claims>",
+    ]
+    if brand_guidelines:
+        context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
+    if component_patterns:
+        context_parts.append(f"<component_patterns>\n{json.dumps(component_patterns, indent=2)}\n</component_patterns>")
+
+    user_content = "\n\n".join(context_parts)
+
+    response = client.messages.create(
+        model='claude-sonnet-4-6',
+        max_tokens=2048,
+        system=BUILD_SLIDE_SYSTEM,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": "build_slide"},
+        messages=[{'role': 'user', 'content': user_content}],
+    )
+
+    for block in response.content:
+        if block.type == 'tool_use' and block.name == 'build_slide':
+            result = block.input
+            print(f"[DEBUG] Built slide for '{slide_topic}': {result.get('layout')}")
+
+            # Post-check: scrub any claim_ids not in the provided set
+            valid_ids = set(claim_ids)
+            headline = result.get('headline', {})
+            if headline.get('claim_id') and headline['claim_id'] not in valid_ids:
+                print(f"[WARN] headline claim_id '{headline['claim_id']}' not valid, replacing with {claim_ids[0]}")
+                headline['claim_id'] = claim_ids[0]
+
+            for claim_list_key in ('body_claims', 'footer_claims'):
+                result[claim_list_key] = [
+                    c for c in result.get(claim_list_key, [])
+                    if c.get('claim_id') in valid_ids
+                ]
+
+            return result
+
+    raise ValueError(f"Slide builder did not return a slide for topic: {slide_topic}")
+
+
+def generate_slide_spec(
+    prompt: str,
+    claims: list,
+    brand_guidelines: Optional[dict] = None,
+    target_audience: Optional[str] = None,
+    audience_rules: Optional[dict] = None,
+    history: Optional[list] = None,
+    component_patterns: Optional[dict] = None,
+) -> dict:
+    """
+    Incremental per-slide generation pipeline.
+    Step 0: Narrative plan → per-slide loop (1a: prefilter, 1b: select, 2+3+4: build).
+    Returns the parsed slide spec dict.
+    """
+    # Step 0: Plan narrative
+    plan = _plan_narrative(prompt, claims, brand_guidelines,
+                           target_audience, audience_rules, history)
+
+    slides = []
+    for slide_plan in plan.get('slides', []):
+        topic = slide_plan['topic']
+        print(f"[DEBUG] Processing slide: {topic}")
+
+        # Step 1a: Programmatic pre-filter
+        candidates = _prefilter_claims(claims, slide_plan)
+        print(f"[DEBUG] Pre-filtered {len(candidates)} candidates for '{topic}'")
+
+        # Step 1b: LLM strict selection
+        selected = _select_claims(topic, candidates)
+
+        # Steps 2+3+4: Build slide
+        slide = _build_slide(topic, selected, claims,
+                             brand_guidelines, component_patterns)
+        slides.append(slide)
+
+    return {"slides": slides}
 
 
 # ── Design token extraction ───────────────────────────────────────────────────
