@@ -67,21 +67,15 @@ export type BrandGuidelines = {
   otherRelevantGuidelines?: Record<string, { rules: string[] }>
 }
 
-export type SlideTemplate = {
-  name: string
-  description: string
-  layout: string
-  bestFor: string
-}
-
 export type DesignSystem = {
   id: number
   name: string
   pdf_filename: string
   tokens: DesignTokens
   brand_guidelines: BrandGuidelines
-  slide_templates: SlideTemplate[]
   component_patterns: Record<string, any>
+  extraction_status: string
+  extraction_step: string | null
   is_default: boolean
   created_at: string
   updated_at: string
@@ -129,11 +123,24 @@ export type ReviewFlag = {
   note: string
 }
 
+export type TraceEntry = {
+  slide: number
+  element: string
+  claim_id: string
+  claim_text: string
+  source: string
+}
+
 export type ReviewReport = {
   verdict: 'approved' | 'flagged' | 'blocked'
   confidence: number
   flags: ReviewFlag[]
   summary: string
+  trace?: TraceEntry[]
+  soft_checks?: {
+    flags: ReviewFlag[]
+    summary?: string
+  }
 }
 
 export type Message = {

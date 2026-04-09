@@ -1,8 +1,116 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import Sidebar from '@/components/Sidebar'
-import { api, type DesignSystem, type DesignSystemAsset, type Session, type BrandGuidelines, type SlideTemplate } from '@/lib/api'
+import { api, type DesignSystem, type DesignSystemAsset, type Session, type BrandGuidelines } from '@/lib/api'
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5001'
+
+const EXTRACTION_STEPS = [
+  { key: 'tokens', label: 'Design Tokens' },
+  { key: 'brand_guidelines', label: 'Brand Guidelines' },
+  { key: 'component_patterns', label: 'Component Patterns' },
+  { key: 'assets', label: 'Brand Assets' },
+] as const
+
+function ExtractionTimeline({ dsId, onDone }: { dsId: number; onDone: (ds: DesignSystem) => void }) {
+  const [completed, setCompleted] = useState(0)
+  const [currentStep, setCurrentStep] = useState<string | null>('tokens')
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    const es = new EventSource(`${API_BASE}/api/design-system/${dsId}/extraction-stream`)
+
+    es.addEventListener('progress', (e) => {
+      const data = JSON.parse(e.data)
+      setCompleted(data.completed)
+      setCurrentStep(data.step)
+    })
+
+    es.addEventListener('done', (e) => {
+      const ds = JSON.parse(e.data)
+      es.close()
+      onDone(ds)
+    })
+
+    es.addEventListener('error', (e) => {
+      try {
+        const data = JSON.parse((e as MessageEvent).data)
+        setCurrentStep(data.step)
+      } catch {}
+      setFailed(true)
+      es.close()
+    })
+
+    es.onerror = () => {
+      es.close()
+    }
+
+    return () => es.close()
+  }, [dsId, onDone])
+
+  return (
+    <div className="flex flex-1 items-center justify-center bg-slate-50">
+      <div className="w-72">
+        <p className="text-sm font-semibold text-slate-800 mb-6 text-center">Extracting Design System</p>
+        <div className="relative pl-8">
+          {EXTRACTION_STEPS.map((step, i) => {
+            const isDone = i < completed
+            const isActive = !isDone && step.key === currentStep
+            const isPending = !isDone && !isActive
+
+            return (
+              <div key={step.key} className="relative pb-6 last:pb-0">
+                {/* Connector line */}
+                {i < EXTRACTION_STEPS.length - 1 && (
+                  <div
+                    className={`absolute left-[-20px] top-[18px] w-[2px] h-[calc(100%-6px)] ${
+                      isDone ? 'bg-indigo-500' : 'bg-slate-200'
+                    }`}
+                  />
+                )}
+
+                {/* Step indicator */}
+                <div className="absolute left-[-26px] top-[2px] flex items-center justify-center">
+                  {isDone ? (
+                    <div className="w-[13px] h-[13px] rounded-full bg-indigo-500 flex items-center justify-center">
+                      <svg className="w-2 h-2 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M5 13l4 4L19 7" />
+                      </svg>
+                    </div>
+                  ) : isActive ? (
+                    <div className="w-[13px] h-[13px] rounded-full border-2 border-indigo-500 bg-white">
+                      <div className="w-full h-full rounded-full bg-indigo-500 animate-pulse" />
+                    </div>
+                  ) : (
+                    <div className="w-[13px] h-[13px] rounded-full border-2 border-slate-300 bg-white" />
+                  )}
+                </div>
+
+                {/* Label */}
+                <div className="min-h-[18px]">
+                  <p className={`text-sm leading-tight ${
+                    isDone ? 'text-slate-800 font-medium' :
+                    isActive ? 'text-indigo-600 font-medium' :
+                    'text-slate-400'
+                  }`}>
+                    {step.label}
+                  </p>
+                  {isActive && !failed && (
+                    <p className="text-xs text-indigo-400 mt-0.5">Extracting...</p>
+                  )}
+                  {isActive && failed && (
+                    <p className="text-xs text-red-500 mt-0.5">Failed</p>
+                  )}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
 
 type Tab = 'tokens' | 'brand' | 'assets'
 
@@ -264,14 +372,13 @@ function DynamicSection({ title, value }: { title: string; value: unknown }) {
   return null
 }
 
-function BrandTab({ guidelines, templates, componentPatterns }: { guidelines: BrandGuidelines; templates: SlideTemplate[]; componentPatterns: Record<string, any> }) {
+function BrandTab({ guidelines, componentPatterns }: { guidelines: BrandGuidelines; componentPatterns: Record<string, any> }) {
   const hasGuidelines = guidelines && Object.values(guidelines).some((v) =>
     Array.isArray(v) ? v.length > 0 : Boolean(v)
   )
-  const hasTemplates = templates && templates.length > 0
   const hasPatterns = componentPatterns && Object.keys(componentPatterns).length > 0
 
-  if (!hasGuidelines && !hasTemplates && !hasPatterns) {
+  if (!hasGuidelines && !hasPatterns) {
     return (
       <div className="flex flex-col items-center justify-center h-40 text-slate-400 text-sm">
         No brand guidelines extracted. Try re-uploading your style guide.
@@ -359,31 +466,6 @@ function BrandTab({ guidelines, templates, componentPatterns }: { guidelines: Br
             <DynamicSection key={key} title={labelFromKey(key)} value={value} />
           ))}
         </>
-      )}
-
-      {hasTemplates && (
-        <Section title="Slide Templates">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            {templates.map((tmpl, i) => (
-              <div key={i} className="rounded-xl border border-slate-200 bg-white p-4 space-y-1.5">
-                <p className="text-sm font-semibold text-slate-800">{tmpl.name}</p>
-                {tmpl.description && <p className="text-xs text-slate-500">{tmpl.description}</p>}
-                {tmpl.layout && (
-                  <div className="flex gap-1.5 items-center text-xs text-slate-500">
-                    <span className="font-medium text-slate-600">Layout:</span>
-                    <span>{tmpl.layout}</span>
-                  </div>
-                )}
-                {tmpl.bestFor && (
-                  <div className="flex gap-1.5 items-center text-xs text-slate-500">
-                    <span className="font-medium text-slate-600">Best for:</span>
-                    <span>{tmpl.bestFor}</span>
-                  </div>
-                )}
-              </div>
-            ))}
-          </div>
-        </Section>
       )}
 
       {hasPatterns && (
@@ -617,9 +699,18 @@ export default function DesignSystemPage() {
   const [name, setName] = useState('')
   const [loading, setLoading] = useState(false)
   const [dragOver, setDragOver] = useState(false)
+  const [extractingDsId, setExtractingDsId] = useState<number | null>(null)
 
   useEffect(() => {
-    api.designSystem.list().then(setSystems).catch(console.error)
+    api.designSystem.list().then((list) => {
+      setSystems(list)
+      // Reconnect to any in-progress extraction after page reload
+      const extracting = list.find((s) => s.extraction_status === 'extracting')
+      if (extracting) {
+        setSelected(extracting)
+        setExtractingDsId(extracting.id)
+      }
+    }).catch(console.error)
     api.sessions.list().then(setSessions).catch(console.error)
   }, [])
 
@@ -631,7 +722,7 @@ export default function DesignSystemPage() {
       const ds = await api.designSystem.upload(file, name)
       setSystems((prev) => [ds, ...prev])
       setSelected(ds)
-      setTab('tokens')
+      setExtractingDsId(ds.id)
       setFile(null)
       setName('')
     } catch (err) {
@@ -640,6 +731,13 @@ export default function DesignSystemPage() {
       setLoading(false)
     }
   }
+
+  const handleExtractionDone = useCallback((ds: DesignSystem) => {
+    setExtractingDsId(null)
+    setSelected(ds)
+    setSystems((prev) => prev.map((s) => (s.id === ds.id ? ds : s)))
+    setTab('tokens')
+  }, [])
 
   async function handleDelete(id: number) {
     await api.designSystem.delete(id)
@@ -758,7 +856,9 @@ export default function DesignSystemPage() {
 
         {/* Right panel: detail */}
         <div className="flex flex-1 flex-col overflow-hidden bg-slate-50">
-          {!selected ? (
+          {extractingDsId ? (
+            <ExtractionTimeline dsId={extractingDsId} onDone={handleExtractionDone} />
+          ) : !selected ? (
             <div className="flex flex-1 flex-col items-center justify-center text-center text-slate-400 px-8">
               <svg className="h-12 w-12 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M4 5a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1V5zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1V5zM4 15a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1H5a1 1 0 01-1-1v-4zm10 0a1 1 0 011-1h4a1 1 0 011 1v4a1 1 0 01-1 1h-4a1 1 0 01-1-1v-4z" />
@@ -795,7 +895,7 @@ export default function DesignSystemPage() {
                 {tab === 'tokens' ? (
                   <TokensTab tokens={selected.tokens} />
                 ) : tab === 'brand' ? (
-                  <BrandTab guidelines={selected.brand_guidelines ?? {}} templates={selected.slide_templates ?? []} componentPatterns={selected.component_patterns ?? {}} />
+                  <BrandTab guidelines={selected.brand_guidelines ?? {}} componentPatterns={selected.component_patterns ?? {}} />
                 ) : (
                   <AssetsTab dsId={selected.id} />
                 )}

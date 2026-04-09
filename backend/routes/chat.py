@@ -76,7 +76,6 @@ def send_message(session_id):
 
     design_tokens      = None
     brand_guidelines   = None
-    slide_templates    = None
     component_patterns = None
     ds_assets          = []
     audience_rules     = None
@@ -86,7 +85,6 @@ def send_message(session_id):
         if ds:
             design_tokens      = ds.tokens
             brand_guidelines   = ds.brand_guidelines
-            slide_templates    = ds.slide_templates
             component_patterns = ds.component_patterns
             audience_rules     = (ds.brand_guidelines or {}).get('audienceRules') if ds else None
             raw_assets = DesignSystemAsset.query.filter_by(design_system_id=ds_id).all()
@@ -166,7 +164,7 @@ def send_message(session_id):
                         # Fresh generation path
                         print(f"[DEBUG] Using generate_slide_spec path (no prev_spec)")
                         spec = generate_slide_spec(
-                            prompt, claims_list, brand_guidelines, slide_templates,
+                            prompt, claims_list, brand_guidelines,
                             target_audience, audience_rules, slim_history,
                         )
                     errors = validate_slide_spec(spec, list(claims_by_id.keys()), brand_guidelines)
@@ -175,7 +173,7 @@ def send_message(session_id):
                         # Retry as fresh generation with errors as feedback
                         spec = generate_slide_spec(
                             prompt + f"\n\nFix these validation errors: {'; '.join(errors)}",
-                            claims_list, brand_guidelines, slide_templates,
+                            claims_list, brand_guidelines,
                             target_audience, audience_rules, slim_history,
                         )
                         errors = validate_slide_spec(spec, list(claims_by_id.keys()), brand_guidelines)
@@ -219,7 +217,7 @@ def send_message(session_id):
                             try:
                                 html_content = render_spec_to_html(
                                     spec, claims_by_id, design_tokens,
-                                    brand_guidelines, slide_templates, ds_assets,
+                                    brand_guidelines, ds_assets,
                                     current_html=prev_html if is_edit else None,
                                     component_patterns=component_patterns,
                                 )
@@ -247,7 +245,6 @@ def send_message(session_id):
             kb_texts=kb_texts or None,
             history=slim_history,
             brand_guidelines=brand_guidelines,
-            slide_templates=slide_templates,
             ds_assets=ds_assets,
             target_audience=target_audience,
             audience_rules=audience_rules,
@@ -267,7 +264,6 @@ def send_message(session_id):
                 kb_texts=None,
                 history=slim_history,
                 brand_guidelines=None,
-                slide_templates=None,
                 ds_assets=None,
             )
         except Exception:

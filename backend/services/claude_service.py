@@ -128,21 +128,6 @@ Example shape (names and rules are illustrative only — use what is in the docu
   }
 }"""
 
-SLIDE_TEMPLATES_SYSTEM_PROMPT = """You are a slide designer. Based on the provided style guide, define 4-6 recommended slide template layouts as a JSON array. Each template should be practical for pharma HCP content.
-
-Return ONLY a valid JSON array matching this schema:
-[
-  {
-    "name": "",
-    "description": "",
-    "layout": "",
-    "bestFor": ""
-  }
-]
-
-Examples of good templates: 3-column data cards, 2-column comparison, key stat + supporting cards, full-width data table, efficacy summary with hero number."""
-
-
 COMPONENT_PATTERNS_SYSTEM_PROMPT = """You are a design system analyst. You will receive rendered pages from a design system / style guide document as images.
 
 Your job: identify every distinct visual pattern, component, rule, and styling specification this document defines. Extract each one into a structured JSON description that another AI can consume to produce pixel-accurate HTML/CSS output matching this brand.
@@ -229,7 +214,7 @@ When <brand_guidelines> is present, every field is a hard constraint that overri
 4. BRAND VISUAL LANGUAGE — applies to every element you create:
 The `hallmark` and `layoutPrinciples` define a visual language that must cascade to every design decision on every slide — not just icons. If the brand calls for circular shapes, soft curves, and flowing gradients, then every container, card, border, divider, background element, and frame must express that same language. Before placing any element, ask: does this shape, edge, and color feel like it belongs in this brand's world? If the `prohibited` list bans sharp edges, that ban applies to layout containers, data cards, image frames, and every div you create — not just decorative elements. There are no exceptions for "structural" elements.
 
-5. LAYOUT: Apply `layoutPrinciples` literally — generous whitespace, structural elements (accent bars, gradient strokes, violators) placed correctly. Do not invent decorative patterns — colored card borders, side accents, divider lines, or any other visual element — that are not explicitly described in `brand_guidelines`, `slide_templates`, or `<design_tokens>`. If the brand does not specify card border colors, cards have no colored border. Every decoration must have a source in the guidelines.
+5. LAYOUT: Apply `layoutPrinciples` literally — generous whitespace, structural elements (accent bars, gradient strokes, violators) placed correctly. Do not invent decorative patterns — colored card borders, side accents, divider lines, or any other visual element — that are not explicitly described in `brand_guidelines`, `<component_patterns>`, or `<design_tokens>`. If the brand does not specify card border colors, cards have no colored border. Every decoration must have a source in the guidelines.
 
 VISUAL BALANCE & ALIGNMENT — non-negotiable:
 - Every slide must read as visually balanced. No single region should carry significantly more visual weight than the others.
@@ -271,7 +256,7 @@ DESIGN TOKENS — use exact values, no approximations:
 - Hex colors, font families, sizes, weights, line heights — use exactly as specified.
 
 COMPONENT PATTERNS — visual source of truth (highest priority):
-When <component_patterns> is present, it contains the brand's complete visual specification extracted from their style guide via vision analysis. It overrides <design_tokens> and <slide_templates> for all visual decisions.
+When <component_patterns> is present, it contains the brand's complete visual specification extracted from their style guide via vision analysis. It overrides <design_tokens> for all visual decisions.
 - "patterns": every named visual component the brand defines. Before building any element (header, footer, chart, table, card, icon, callout), check if a matching pattern exists. If it does, apply its properties exactly.
 - "colorSystem": the full palette with roles and hierarchy. Use the right color for the right context — drug data in the drug color, placebo in the placebo color, headlines in the headline color. Use gradients exactly as specified in CSS syntax.
 - "typographySystem.contextualRules": font styling varies by content role, not just heading level. Apply the exact font, weight, color, and case for each context (headlines, chart heads, body copy, drug data, placebo data, bullet points, etc).
@@ -287,10 +272,6 @@ BRAND ASSETS:
 
 CTAs — strict rule:
 Never generate a call-to-action, button, or link of any kind unless the user has explicitly provided a destination URL in their request. Slides are static presentation assets — a CTA with no real destination is a design error. If no URL is provided, omit the CTA entirely and use the space for content.
-
-SLIDE TEMPLATES:
-- Use the closest matching template from <slide_templates> for each slide's content type.
-- Follow the template's layout structure, not just its name.
 
 LAYOUT OPTIONS — choose based on content type:
 When no specific template is available, pick the layout that best fits the content:
@@ -372,7 +353,6 @@ def chat_response(
     kb_texts: Optional[list] = None,
     history: Optional[list] = None,
     brand_guidelines: Optional[dict] = None,
-    slide_templates: Optional[list] = None,
     ds_assets: Optional[list] = None,
     target_audience: Optional[str] = None,
     audience_rules: Optional[dict] = None,
@@ -382,8 +362,6 @@ def chat_response(
     context_parts = []
     if brand_guidelines:
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
-    if slide_templates:
-        context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
     if component_patterns:
         context_parts.append(f"<component_patterns>\n{json.dumps(component_patterns, indent=2)}\n</component_patterns>")
     if ds_assets:
@@ -411,7 +389,6 @@ def generate_content(
     prompt: str,
     design_tokens: Optional[dict] = None,
     brand_guidelines: Optional[dict] = None,
-    slide_templates: Optional[list] = None,
     ds_assets: Optional[list] = None,
     kb_texts: Optional[list] = None,
     current_draft: Optional[str] = None,
@@ -427,8 +404,6 @@ def generate_content(
         context_parts.append(f"<design_tokens>\n{json.dumps(design_tokens, indent=2)}\n</design_tokens>")
     if brand_guidelines:
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
-    if slide_templates:
-        context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
     if component_patterns:
         context_parts.append(f"<component_patterns>\n{json.dumps(component_patterns, indent=2)}\n</component_patterns>")
     if ds_assets:
@@ -539,51 +514,6 @@ def extract_brand_guidelines(pdf_text: str, pdf_filepath: Optional[str] = None) 
         return json.loads(raw)
     except Exception:
         return {}
-
-
-def extract_slide_templates(pdf_text: str, pdf_filepath: Optional[str] = None) -> list:
-    client = _get_client()
-
-    # Vision-based extraction
-    if pdf_filepath:
-        from services.pdf_service import render_pdf_pages_as_images
-        pages = render_pdf_pages_as_images(pdf_filepath, max_pages=15)
-        if pages:
-            content: list = []
-            for b64, mime in pages:
-                content.append({'type': 'image', 'source': {'type': 'base64', 'media_type': mime, 'data': b64}})
-            content.append({
-                'type': 'text',
-                'text': (
-                    'These are pages from a pharma brand style guide. '
-                    'Identify all slide/page layout templates shown or described. '
-                    'Return only the JSON array.'
-                ),
-            })
-            try:
-                message = client.messages.create(
-                    model='claude-opus-4-6',
-                    max_tokens=8192,
-                    system=SLIDE_TEMPLATES_SYSTEM_PROMPT,
-                    messages=[{'role': 'user', 'content': content}],
-                )
-                raw = _parse_json_response(message.content[0].text)
-                return json.loads(raw)
-            except Exception:
-                pass
-
-    # Text-based fallback
-    try:
-        message = client.messages.create(
-            model='claude-opus-4-6',
-            max_tokens=8192,
-            system=SLIDE_TEMPLATES_SYSTEM_PROMPT,
-            messages=[{'role': 'user', 'content': f'Based on this style guide, define recommended slide templates:\n---\n{pdf_text}\n---\nReturn only the JSON array.'}],
-        )
-        raw = _parse_json_response(message.content[0].text)
-        return json.loads(raw)
-    except Exception:
-        return []
 
 
 def extract_component_patterns(pdf_filepath: str, pdf_text: str = "") -> dict:
@@ -916,7 +846,8 @@ HARD RULES:
 - Do NOT change, rephrase, add to, or remove ANY factual text in the spec. Render every claim's text VERBATIM.
 - slide_title and cta_text may be rendered with creative typography but their wording is also fixed.
 - You MUST apply the brand's full visual language: gradients, decorative elements, icons, typography hierarchy, color treatments — everything that makes the brand come alive.
-- Follow the layout type specified for each slide but express it through the brand's design language, not a generic template."""
+- Follow the layout type specified for each slide but express it through the brand's design language, not a generic template.
+- IMPORTANT: Every claim text element MUST be wrapped in a span with data-claim-id and contenteditable="false": <span data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked">CLAIM TEXT</span>. This applies to headline text, body claim text, and footer claim text. The claim_id is provided alongside each text field in the spec."""
 )
 
 
@@ -925,7 +856,6 @@ def render_spec_to_html(
     claims_by_id: dict,
     design_tokens: Optional[dict] = None,
     brand_guidelines: Optional[dict] = None,
-    slide_templates: Optional[list] = None,
     ds_assets: Optional[list] = None,
     current_html: Optional[str] = None,
     component_patterns: Optional[dict] = None,
@@ -947,11 +877,13 @@ def render_spec_to_html(
         h = slide.get("headline", {})
         hid = h.get("claim_id")
         s["headline"] = {
+            "claim_id": hid or "",
             "text": claims_by_id[hid]["text"] if hid and hid in claims_by_id else "",
             "emphasis": h.get("emphasis"),
         }
         s["body_claims"] = [
             {
+                "claim_id": b.get("claim_id", ""),
                 "text": claims_by_id[b["claim_id"]]["text"] if b.get("claim_id") and b["claim_id"] in claims_by_id else "",
                 "role": b.get("role", "supporting"),
             }
@@ -959,6 +891,7 @@ def render_spec_to_html(
         ]
         s["footer_claims"] = [
             {
+                "claim_id": f.get("claim_id", ""),
                 "text": claims_by_id[f["claim_id"]]["text"] if f.get("claim_id") and f["claim_id"] in claims_by_id else "",
             }
             for f in slide.get("footer_claims", [])
@@ -971,8 +904,6 @@ def render_spec_to_html(
         context_parts.append(f"<design_tokens>\n{json.dumps(design_tokens, indent=2)}\n</design_tokens>")
     if brand_guidelines:
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
-    if slide_templates:
-        context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
     if component_patterns:
         context_parts.append(f"<component_patterns>\n{json.dumps(component_patterns, indent=2)}\n</component_patterns>")
     if ds_assets:
@@ -1188,7 +1119,6 @@ def generate_slide_spec(
     prompt: str,
     claims: list,
     brand_guidelines: Optional[dict] = None,
-    slide_templates: Optional[list] = None,
     target_audience: Optional[str] = None,
     audience_rules: Optional[dict] = None,
     history: Optional[list] = None,
@@ -1221,8 +1151,6 @@ def generate_slide_spec(
     context_parts = []
     if brand_guidelines:
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
-    if slide_templates:
-        context_parts.append(f"<slide_templates>\n{json.dumps(slide_templates, indent=2)}\n</slide_templates>")
     if target_audience:
         context_parts.append(f"<target_audience>\n{target_audience}\n</target_audience>")
     if audience_rules and target_audience and target_audience in audience_rules:

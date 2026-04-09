@@ -33,6 +33,16 @@ function parseSlides(html: string): string[] {
   return [html]
 }
 
+const CLAIM_LOCKED_STYLE = `
+  .claim-locked, [data-claim-id][contenteditable="false"] {
+    background: rgba(59, 130, 246, 0.08);
+    cursor: not-allowed;
+    border-radius: 2px;
+    padding: 0 1px;
+    user-select: none;
+  }
+`
+
 const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }: { html: string; onSave: (updated: string) => void; paneH: number }) {
   const innerRef = useRef<HTMLDivElement>(null)
   const wrapRef = useRef<HTMLDivElement>(null)
@@ -53,6 +63,15 @@ const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }:
     return () => ro.disconnect()
   }, [html, paneH])
 
+  // Inject claim-locked styles into the slide HTML
+  const styledHtml = React.useMemo(() => {
+    const s = sanitizeHtml(html)
+    if (s.includes('data-claim-id') && !s.includes('claim-locked-injected')) {
+      return `<style class="claim-locked-injected">${CLAIM_LOCKED_STYLE}</style>${s}`
+    }
+    return s
+  }, [html])
+
   return (
     <div
       ref={wrapRef}
@@ -63,7 +82,7 @@ const EditableSlide = React.memo(function EditableSlide({ html, onSave, paneH }:
         contentEditable
         suppressContentEditableWarning
         style={{ width: 1024, height: 576, transformOrigin: 'center center', flexShrink: 0, overflow: 'hidden', outline: 'none' }}
-        dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) }}
+        dangerouslySetInnerHTML={{ __html: styledHtml }}
         onBlur={(e) => onSave(e.currentTarget.outerHTML)}
       />
     </div>
@@ -1054,9 +1073,53 @@ export default function SessionPage() {
                   </button>
 
                   {reviewOpen && (
-                    <div className="px-4 pb-4 space-y-3 max-h-64 overflow-y-auto">
+                    <div className="px-4 pb-4 space-y-4 max-h-96 overflow-y-auto">
+                      {/* Summary */}
                       <p className="text-xs text-slate-500">{currentReview.summary}</p>
-                      {currentReview.flags.length > 0 && (
+
+                      {/* Review Agent Findings (soft checks) */}
+                      {(currentReview.soft_checks?.flags?.length ?? 0) > 0 && (
+                        <div>
+                          <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Review Agent Findings</p>
+                          <ul className="space-y-2">
+                            {currentReview.soft_checks!.flags.map((flag, i) => (
+                              <li key={i} className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2 text-xs space-y-1">
+                                <div className="flex items-start justify-between gap-2">
+                                  <p className="text-slate-700 font-medium flex-1">{flag.claim}</p>
+                                  <StatusChip status={flag.status} />
+                                </div>
+                                <p className="text-slate-400">{flag.note}</p>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {/* Claim Traceability */}
+                      {(currentReview.trace?.length ?? 0) > 0 && (
+                        <div>
+                          <p className="text-[10px] font-semibold uppercase tracking-wider text-slate-400 mb-1.5">Claim Traceability</p>
+                          <ul className="space-y-2">
+                            {currentReview.trace!.map((entry, i) => (
+                              <li key={i} className="rounded-lg border border-slate-100 bg-blue-50/50 px-3 py-2 text-xs space-y-1">
+                                <div className="flex items-center gap-2">
+                                  <span className="inline-flex items-center rounded bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600">
+                                    Slide {entry.slide}
+                                  </span>
+                                  <span className="text-slate-400 text-[10px]">{entry.element}</span>
+                                </div>
+                                <p className="text-slate-700">{entry.claim_text}</p>
+                                {entry.source && (
+                                  <p className="text-slate-400 italic">Source: {entry.source}</p>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {/* Legacy top-level flags fallback */}
+                      {currentReview.flags.length > 0 && !(currentReview.soft_checks?.flags?.length) && (
                         <ul className="space-y-2">
                           {currentReview.flags.map((flag, i) => (
                             <li key={i} className="rounded-lg border border-slate-100 bg-slate-50 px-3 py-2 text-xs space-y-1">
