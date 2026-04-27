@@ -526,14 +526,21 @@ def _parse_json_response(raw: str):
 
 
 
-def extract_brand_guidelines(pdf_text: str, pdf_filepath: Optional[str] = None) -> dict:
+def extract_brand_guidelines(pdf_text: str, pdf_filepath: Optional[str] = None, tables: list = None) -> dict:
     client = _get_client()
     try:
+        prompt = f'Extract brand guidelines from this style guide:\n---\n{pdf_text}\n---\n'
+        if tables:
+            table_text = '\n\n'.join(
+                f'Table {t["index"]} (page {t["page_no"]}):\n{t["markdown"]}' for t in tables
+            )
+            prompt += f'\nStructured tables extracted from the PDF:\n---\n{table_text}\n---\n'
+        prompt += 'Return only the JSON object.'
         message = client.messages.create(
             model='claude-opus-4-6',
             max_tokens=8192,
             system=BRAND_GUIDELINES_SYSTEM_PROMPT,
-            messages=[{'role': 'user', 'content': f'Extract brand guidelines from this style guide:\n---\n{pdf_text}\n---\nReturn only the JSON object.'}],
+            messages=[{'role': 'user', 'content': prompt}],
         )
         raw = _parse_json_response(message.content[0].text)
         return json.loads(raw)
@@ -1679,15 +1686,22 @@ def generate_slide_spec(
 
 # ── Design token extraction ───────────────────────────────────────────────────
 
-def extract_design_tokens(pdf_text: str) -> dict:
+def extract_design_tokens(pdf_text: str, tables: list = None) -> dict:
     client = _get_client()
+    prompt = f'Extract all design tokens from this style guide:\n---\n{pdf_text}\n---\n'
+    if tables:
+        table_text = '\n\n'.join(
+            f'Table {t["index"]} (page {t["page_no"]}):\n{t["markdown"]}' for t in tables
+        )
+        prompt += f'\nStructured tables extracted from the PDF:\n---\n{table_text}\n---\n'
+    prompt += 'Return only the JSON object, no explanation.'
     message = client.messages.create(
         model='claude-opus-4-6',
         max_tokens=8192,
         system=SYSTEM_PROMPT,
         messages=[{
             'role': 'user',
-            'content': f'Extract all design tokens from this style guide:\n---\n{pdf_text}\n---\nReturn only the JSON object, no explanation.',
+            'content': prompt,
         }],
     )
     raw = message.content[0].text.strip()

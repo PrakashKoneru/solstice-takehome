@@ -11,6 +11,7 @@ backend/*.pyc
 backend/.env
 backend/uploads/
 backend/venv/
+backend/venv312/
 backend/.venv/
 
 # General

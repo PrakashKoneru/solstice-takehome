@@ -8,7 +8,7 @@ from flask import Blueprint, jsonify, request, current_app, Response
 from werkzeug.utils import secure_filename
 from extensions import db
 from models import DesignSystem, DesignSystemAsset
-from services.pdf_service import extract_text_from_pdf, extract_assets_from_pdf
+from services.pdf_service import extract_text_from_pdf, extract_assets_from_pdf, extract_tables_docling
 from services.claude_service import extract_design_tokens, extract_brand_guidelines, extract_component_patterns
 
 design_system_bp = Blueprint('design_system', __name__, url_prefix='/api/design-system')
@@ -34,10 +34,13 @@ def _run_extraction(app, ds_id, filepath, pdf_text):
         try:
             ds = db.session.get(DesignSystem, ds_id)
 
+            # Pre-step: extract structured tables via docling for better accuracy
+            structured_tables = extract_tables_docling(filepath)
+
             # Step 1: Design Tokens
             ds.extraction_step = 'tokens'
             db.session.commit()
-            tokens = extract_design_tokens(pdf_text)
+            tokens = extract_design_tokens(pdf_text, tables=structured_tables)
             ds = db.session.get(DesignSystem, ds_id)
             ds.tokens = tokens
             db.session.commit()
@@ -45,7 +48,7 @@ def _run_extraction(app, ds_id, filepath, pdf_text):
             # Step 2: Brand Guidelines
             ds.extraction_step = 'brand_guidelines'
             db.session.commit()
-            brand_guidelines = extract_brand_guidelines(pdf_text, pdf_filepath=filepath)
+            brand_guidelines = extract_brand_guidelines(pdf_text, pdf_filepath=filepath, tables=structured_tables)
             ds = db.session.get(DesignSystem, ds_id)
             ds.brand_guidelines = brand_guidelines
             db.session.commit()
