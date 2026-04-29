@@ -8,7 +8,7 @@ from flask import Blueprint, jsonify, request, current_app, Response
 from werkzeug.utils import secure_filename
 from extensions import db
 from models import DesignSystem, DesignSystemAsset
-from services.pdf_service import extract_text_from_pdf, extract_assets_from_pdf
+from services.pdf_service import extract_text_from_pdf, extract_assets_from_pdf, extract_tables_docling
 from services.claude_service import extract_design_tokens, extract_brand_guidelines, extract_component_patterns
 
 design_system_bp = Blueprint('design_system', __name__, url_prefix='/api/design-system')
@@ -34,10 +34,13 @@ def _run_extraction(app, ds_id, filepath, pdf_text):
         try:
             ds = db.session.get(DesignSystem, ds_id)
 
+            # Pre-step: extract structured tables via docling for better accuracy
+            structured_tables = extract_tables_docling(filepath)
+
             # Step 1: Design Tokens
             ds.extraction_step = 'tokens'
             db.session.commit()
-            tokens = extract_design_tokens(pdf_text)
+            tokens = extract_design_tokens(pdf_text, tables=structured_tables)
             ds = db.session.get(DesignSystem, ds_id)
             ds.tokens = tokens
             db.session.commit()
@@ -45,7 +48,7 @@ def _run_extraction(app, ds_id, filepath, pdf_text):
             # Step 2: Brand Guidelines
             ds.extraction_step = 'brand_guidelines'
             db.session.commit()
-            brand_guidelines = extract_brand_guidelines(pdf_text, pdf_filepath=filepath)
+            brand_guidelines = extract_brand_guidelines(pdf_text, pdf_filepath=filepath, tables=structured_tables)
             ds = db.session.get(DesignSystem, ds_id)
             ds.brand_guidelines = brand_guidelines
             db.session.commit()
@@ -58,11 +61,11 @@ def _run_extraction(app, ds_id, filepath, pdf_text):
             ds.component_patterns = component_patterns
             db.session.commit()
 
-            # Step 4: Assets
+            # Step 4: Assets (Claude page-by-page with brand context)
             ds.extraction_step = 'assets'
             db.session.commit()
             upload_dir = app.config['UPLOAD_FOLDER']
-            extracted = extract_assets_from_pdf(filepath, upload_dir)
+            extracted = extract_assets_from_pdf(filepath, upload_dir, brand_guidelines=ds.brand_guidelines)
             ds = db.session.get(DesignSystem, ds_id)
             for asset in extracted:
                 db.session.add(DesignSystemAsset(
@@ -71,7 +74,8 @@ def _run_extraction(app, ds_id, filepath, pdf_text):
                     asset_type=asset['asset_type'],
                     file_url=asset['filepath'],
                     filename=asset['filename'],
-                    source=asset.get('source', 'raster'),
+                    source=asset.get('source', 'claude_crop'),
+                    page_number=asset.get('page_number'),
                 ))
             ds.extraction_status = 'complete'
             ds.extraction_step = None
@@ -139,36 +143,39 @@ def extraction_stream(ds_id):
     app = current_app._get_current_object()
 
     def generate():
-        while True:
-            with app.app_context():
-                ds = db.session.get(DesignSystem, ds_id)
-                if not ds:
-                    yield f"event: error\ndata: {json.dumps({'error': 'design system not found'})}\n\n"
-                    return
+        try:
+            while True:
+                with app.app_context():
+                    ds = db.session.get(DesignSystem, ds_id)
+                    if not ds:
+                        yield f"event: error\ndata: {json.dumps({'error': 'design system not found'})}\n\n"
+                        return
 
-                status = ds.extraction_status
-                step = ds.extraction_step
+                    status = ds.extraction_status
+                    step = ds.extraction_step
 
-                # Calculate completed count
-                if status == 'complete':
-                    completed = len(EXTRACTION_STEPS)
-                elif status == 'failed':
-                    completed = EXTRACTION_STEPS.index(step) if step and step in EXTRACTION_STEPS else 0
-                elif step and step in EXTRACTION_STEPS:
-                    completed = EXTRACTION_STEPS.index(step)
-                else:
-                    completed = 0
+                    # Calculate completed count
+                    if status == 'complete':
+                        completed = len(EXTRACTION_STEPS)
+                    elif status == 'failed':
+                        completed = EXTRACTION_STEPS.index(step) if step and step in EXTRACTION_STEPS else 0
+                    elif step and step in EXTRACTION_STEPS:
+                        completed = EXTRACTION_STEPS.index(step)
+                    else:
+                        completed = 0
 
-                yield f"event: progress\ndata: {json.dumps({'step': step, 'completed': completed, 'total': len(EXTRACTION_STEPS), 'status': status})}\n\n"
+                    yield f"event: progress\ndata: {json.dumps({'step': step, 'completed': completed, 'total': len(EXTRACTION_STEPS), 'status': status})}\n\n"
 
-                if status == 'complete':
-                    yield f"event: done\ndata: {json.dumps(ds.to_dict())}\n\n"
-                    return
-                elif status == 'failed':
-                    yield f"event: error\ndata: {json.dumps({'error': 'extraction failed', 'step': step})}\n\n"
-                    return
+                    if status == 'complete':
+                        yield f"event: done\ndata: {json.dumps(ds.to_dict())}\n\n"
+                        return
+                    elif status == 'failed':
+                        yield f"event: error\ndata: {json.dumps({'error': 'extraction failed', 'step': step})}\n\n"
+                        return
 
-            time.sleep(1)
+                time.sleep(1)
+        except GeneratorExit:
+            pass
 
     return Response(
         generate(),

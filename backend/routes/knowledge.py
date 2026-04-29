@@ -7,8 +7,8 @@ from flask import Blueprint, jsonify, request, current_app, Response
 from werkzeug.utils import secure_filename
 from extensions import db
 from models import KnowledgeItem, Claim
-from services.pdf_service import extract_text_from_pdf, extract_text_by_page
-from services.claim_extractor import extract_claims_streaming
+from services.pdf_service import extract_text_from_pdf, extract_text_by_page, extract_document_outline
+from services.claim_extractor import extract_claims_streaming, assign_sections_to_claims
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +40,14 @@ def _run_extraction(app, item_id, pages):
             item.extraction_status = 'extracting'
             db.session.commit()
 
+            # Get doc_outline for section assignment
+            doc_outline = item.doc_outline or []
+
             def on_page_done(page_num, page_claims):
                 """Insert each page's claims into DB as they arrive."""
+                # Assign sections before writing to DB
+                if doc_outline:
+                    assign_sections_to_claims(page_claims, doc_outline)
                 with app.app_context():
                     for seq_offset, c in enumerate(page_claims):
                         # Generate unique ID using page_num to avoid collisions
@@ -58,6 +64,7 @@ def _run_extraction(app, item_id, pages):
                                 page_number=c.get('page_number'),
                                 numeric_values=c.get('numeric_values', []),
                                 tags=c.get('tags', []),
+                                section=c.get('section'),
                                 is_approved=True,
                             ))
                     db.session.commit()
@@ -103,6 +110,7 @@ def upload_knowledge():
 
     text_content = extract_text_from_pdf(filepath)
     pages = extract_text_by_page(filepath)
+    doc_outline = extract_document_outline(filepath)
 
     item = KnowledgeItem(
         title=title,
@@ -110,6 +118,7 @@ def upload_knowledge():
         file_path=filepath,
         text_content=text_content,
         doc_type=doc_type,
+        doc_outline=doc_outline,
         extraction_status='extracting',
         total_pages=len(pages),
     )

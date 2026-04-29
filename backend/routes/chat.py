@@ -237,9 +237,14 @@ def send_message(session_id):
     db.session.add(user_msg)
 
     kb_texts = []
+    doc_outlines = []
     if kb_doc_ids:
         items = KnowledgeItem.query.filter(KnowledgeItem.id.in_(kb_doc_ids)).all()
         kb_texts = [item.text_content for item in items if item.text_content]
+        for item in items:
+            if item.doc_outline:
+                doc_outlines.extend(item.doc_outline)
+    combined_outline = doc_outlines if doc_outlines else None
 
     # Retrieve previous spec and HTML from last generation (if any)
     prev_spec = None
@@ -270,6 +275,7 @@ def send_message(session_id):
                 claims_list, brand_guidelines,
                 target_audience, audience_rules, slim_history,
                 component_patterns=component_patterns,
+                doc_outline=combined_outline,
             )
             retry_errors = validate_slide_spec(retry_spec, list(claims_by_id.keys()), brand_guidelines)
             if retry_errors:
@@ -381,6 +387,7 @@ def send_message(session_id):
                         prompt, claims_list, brand_guidelines,
                         target_audience, audience_rules, slim_history,
                         component_patterns=component_patterns,
+                        doc_outline=combined_outline,
                     )
                     _finalize_spec(spec, claims_by_id, claims_list, is_edit=False)
                 except Exception as e:
@@ -397,6 +404,8 @@ def send_message(session_id):
             target_audience=target_audience,
             audience_rules=audience_rules,
             component_patterns=component_patterns,
+            doc_outline=combined_outline,
+            current_spec=prev_spec,
         )
 
     # ── Summary after generation ──────────────────────────────────────────────
@@ -487,9 +496,14 @@ def send_message_stream(session_id):
             slim_history.append({'role': 'assistant', 'content': m.content or '[slides generated]'})
 
     kb_texts = []
+    stream_doc_outlines = []
     if kb_doc_ids:
         items = KnowledgeItem.query.filter(KnowledgeItem.id.in_(kb_doc_ids)).all()
         kb_texts = [item.text_content for item in items if item.text_content]
+        for item in items:
+            if item.doc_outline:
+                stream_doc_outlines.extend(item.doc_outline)
+    stream_outline = stream_doc_outlines if stream_doc_outlines else None
 
     prev_spec = None
     prev_html = None
@@ -570,6 +584,7 @@ def send_message_stream(session_id):
                                 claims_list, brand_guidelines,
                                 target_audience, audience_rules, slim_history,
                                 component_patterns=component_patterns,
+                                doc_outline=stream_outline,
                             )
                         try:
                             html_content = render_spec_to_html(
@@ -599,6 +614,7 @@ def send_message_stream(session_id):
                         target_audience, audience_rules, slim_history,
                         component_patterns=component_patterns,
                         on_slide_ready=_on_slide_ready,
+                        doc_outline=stream_outline,
                     )
 
                     # Validate
@@ -610,6 +626,7 @@ def send_message_stream(session_id):
                             claims_list, brand_guidelines,
                             target_audience, audience_rules, slim_history,
                             component_patterns=component_patterns,
+                            doc_outline=stream_outline,
                         )
                         retry_errors = validate_slide_spec(retry_spec, list(claims_by_id.keys()), brand_guidelines)
                         if retry_errors:
@@ -686,6 +703,8 @@ def send_message_stream(session_id):
                         target_audience=target_audience,
                         audience_rules=audience_rules,
                         component_patterns=component_patterns,
+                        doc_outline=stream_outline,
+                        current_spec=prev_spec,
                     )
 
                 # Build summary (LLM-based, matches non-streaming path)

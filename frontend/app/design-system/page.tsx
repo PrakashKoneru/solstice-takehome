@@ -637,19 +637,27 @@ function AssetsTab({ dsId }: { dsId: number }) {
       {assets.length === 0 ? (
         <p className="text-center text-sm text-slate-400 py-6">No assets uploaded yet.</p>
       ) : (() => {
-        const usable = assets.filter(a => a.source !== 'page_render')
-        const reference = assets.filter(a => a.source === 'page_render')
-        const AssetCard = ({ asset }: { asset: typeof assets[0] }) => (
-          <div key={asset.id} className="group relative rounded-xl border border-slate-200 bg-white p-3 flex flex-col items-center gap-2">
-            <div className="h-16 w-16 rounded-lg bg-slate-100 flex items-center justify-center overflow-hidden">
-              {asset.filename.endsWith('.svg') ? (
-                <img src={asset.file_url} alt={asset.name} className="h-12 w-12 object-contain" />
-              ) : (
-                <img src={asset.file_url} alt={asset.name} className="h-full w-full object-cover rounded-lg" />
-              )}
+        // Group assets by page number
+        const byPage = new Map<number | null, DesignSystemAsset[]>()
+        for (const a of assets) {
+          const key = a.page_number
+          if (!byPage.has(key)) byPage.set(key, [])
+          byPage.get(key)!.push(a)
+        }
+        // Sort pages numerically, null (manually uploaded) last
+        const sortedPages = [...byPage.keys()].sort((a, b) => {
+          if (a === null) return 1
+          if (b === null) return -1
+          return a - b
+        })
+
+        const AssetCard = ({ asset }: { asset: DesignSystemAsset }) => (
+          <div className="group relative rounded-xl border border-slate-200 bg-white p-3 flex flex-col items-center gap-2">
+            <div className="h-20 w-full rounded-lg bg-slate-50 flex items-center justify-center overflow-hidden">
+              <img src={asset.file_url} alt={asset.name} className="max-h-full max-w-full object-contain" />
             </div>
             <p className="text-xs font-medium text-slate-700 text-center truncate w-full">{asset.name}</p>
-            <span className="text-xs text-slate-400 capitalize">{asset.asset_type}</span>
+            <span className="text-[10px] text-slate-400 capitalize bg-slate-100 px-1.5 py-0.5 rounded">{asset.asset_type}</span>
             <button
               onClick={() => handleDeleteAsset(asset.id)}
               className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 text-slate-400 hover:text-red-500 transition-all"
@@ -661,26 +669,27 @@ function AssetsTab({ dsId }: { dsId: number }) {
             </button>
           </div>
         )
+
         return (
-          <div className="space-y-6">
-            {usable.length > 0 && (
-              <div>
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
-                  {usable.map(asset => <AssetCard key={asset.id} asset={asset} />)}
+          <div className="space-y-8">
+            {sortedPages.map(pageNum => {
+              const pageAssets = byPage.get(pageNum)!
+              return (
+                <div key={pageNum ?? 'manual'}>
+                  <div className="flex items-center gap-2 mb-3">
+                    <h4 className="text-sm font-semibold text-slate-700">
+                      {pageNum !== null ? `Page ${pageNum}` : 'Manually Uploaded'}
+                    </h4>
+                    <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">
+                      {pageAssets.length} asset{pageAssets.length !== 1 ? 's' : ''}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+                    {pageAssets.map(asset => <AssetCard key={asset.id} asset={asset} />)}
+                  </div>
                 </div>
-              </div>
-            )}
-            {reference.length > 0 && (
-              <div>
-                <div className="flex items-center gap-2 mb-3">
-                  <p className="text-sm font-medium text-slate-500">Captured from PDF</p>
-                  <span className="text-xs text-slate-400 bg-slate-100 px-2 py-0.5 rounded-full">These pages contain brand assets that couldn&apos;t be isolated — coming soon: crop &amp; edit</span>
-                </div>
-                <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
-                  {reference.map(asset => <AssetCard key={asset.id} asset={asset} />)}
-                </div>
-              </div>
-            )}
+              )
+            })}
           </div>
         )
       })()}
