@@ -899,6 +899,12 @@ HARD RULES:
 - Follow the layout type specified for each slide but express it through the brand's design language, not a generic template.
 - IMPORTANT: Every claim text element MUST be wrapped in a span with data-claim-id and contenteditable="false": <span data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked">CLAIM TEXT</span>. This applies to headline text, body claim text, and footer claim text. The claim_id is provided alongside each text field in the spec.
 
+CONTENT FORMAT RENDERING:
+Body claims may have a "content_format" field. Render them as follows:
+- content_format: "text" (default) → render as <span data-claim-id contenteditable="false" class="claim-locked">CLAIM TEXT</span> (unchanged behavior)
+- content_format: "table" → render the table_markdown as a branded HTML table inside <div data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked">. Apply design token colors, fonts, and borders. Keep ALL cell values verbatim — never alter table data.
+- content_format: "figure" → render as <img src="FIGURE_URL" data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked" alt="CLAIM TEXT"> with branded framing (title bar with caption, subtle border consistent with design system).
+
 BRAND ASSET USAGE:
 - If a slide has logo_url, place it per brand guidelines positioning rules (typically top-right or top-left of the header area).
 - Use exact asset URLs from the spec — never construct or guess URLs.
@@ -967,14 +973,19 @@ def render_spec_to_html(
             "text": claims_by_id[hid]["text"] if hid and hid in claims_by_id else "",
             "emphasis": h.get("emphasis"),
         }
-        s["body_claims"] = [
-            {
-                "claim_id": b.get("claim_id", ""),
-                "text": claims_by_id[b["claim_id"]]["text"] if b.get("claim_id") and b["claim_id"] in claims_by_id else "",
+        s["body_claims"] = []
+        for b in slide.get("body_claims", []):
+            cid = b.get("claim_id", "")
+            claim_data = claims_by_id.get(cid, {}) if cid else {}
+            body_entry = {
+                "claim_id": cid,
+                "text": claim_data.get("text", ""),
+                "content_format": claim_data.get("content_format", "text"),
+                "table_markdown": claim_data.get("table_markdown"),
+                "figure_url": claim_data.get("figure_url"),
                 "role": b.get("role", "supporting"),
             }
-            for b in slide.get("body_claims", [])
-        ]
+            s["body_claims"].append(body_entry)
         s["footer_claims"] = [
             {
                 "claim_id": f.get("claim_id", ""),
@@ -999,6 +1010,15 @@ def render_spec_to_html(
             context_parts.append(f"<brand_assets>\n{json.dumps(asset_list, indent=2)}\n</brand_assets>")
 
     context_parts.append(f"<slide_spec>\n{json.dumps(resolved, indent=2)}\n</slide_spec>")
+
+    # Debug: log resolved body claims with visual content
+    for si, slide in enumerate(resolved.get("slides", [])):
+        for bc in slide.get("body_claims", []):
+            if bc.get("content_format") in ("table", "figure"):
+                print(f"[DEBUG] Resolved slide {si} body claim {bc['claim_id']}: "
+                      f"content_format={bc['content_format']}, "
+                      f"figure_url={bc.get('figure_url', 'N/A')}, "
+                      f"table_markdown={'yes' if bc.get('table_markdown') else 'N/A'}")
 
     if current_html:
         context_parts.append(f"<current_html>\n{current_html}\n</current_html>")
@@ -1422,7 +1442,8 @@ Guidelines:
 - Group related data logically (efficacy → safety → dosing)
 - Keep the deck focused — 4-8 slides for a typical request
 - Include ISI/safety information where clinically appropriate
-- When the document outline is available, use its section names in the "section" field to ground each slide in a specific part of the document"""
+- When the document outline is available, use its section names in the "section" field to ground each slide in a specific part of the document
+- When <visual_assets> is provided, these are tables and figures extracted from the document. Incorporate them into the narrative when relevant — e.g. if the user asks for a slide with a chart or table, plan a slide topic that targets that visual asset. Use keywords from the visual asset's text/caption in the slide plan's keywords field."""
 
 SELECT_CLAIMS_SYSTEM = """You are a strict claim selector for pharma slides. Given a slide topic and candidate claims, select ONLY the claims that are directly relevant to this specific slide topic. Err on the side of fewer, more relevant claims.
 
@@ -1431,7 +1452,8 @@ Rules:
 - Select 0-4 claims for supporting roles (supporting, comparison, context, subgroup)
 - Select ISI/boilerplate claims for the "footer" role when available and relevant
 - Do NOT select claims that are tangentially related — strict relevance only
-- Every selected claim must have a clear reason for being on THIS slide"""
+- Every selected claim must have a clear reason for being on THIS slide
+- Claims with content_format "table" or "figure" are visual assets (extracted tables/charts). When the slide topic involves data visualization, charts, or tabular data, prefer selecting these visual claims as they render as rich content on the slide."""
 
 BUILD_SLIDE_SYSTEM = """You are a pharma slide builder. You receive a slide topic, a set of pre-selected claims (with assigned roles), brand guidelines, and component patterns.
 
@@ -1487,7 +1509,13 @@ EMPHASIS — set after layout is decided:
   two_column, stat_row: emphasis.style = "bold" on headline numeric_value_index 0
   three_column_cards: emphasis.style = "color_accent" on each card's key numeric_value_index
   comparison_table, data_table, subgroup_forest: no emphasis (data speaks for itself)
-  footer claims: never set emphasis"""
+  footer claims: never set emphasis
+
+CONTENT FORMAT OVERRIDES:
+When a claim has content_format other than "text", apply these layout overrides:
+- content_format: "table" → prefer data_table layout to display the table_markdown properly
+- content_format: "figure" → prefer two_column layout with the figure in one column, or full-width figure display
+These overrides take priority over the VWES decision tree above."""
 
 
 def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_rules, history, doc_outline=None):
@@ -1497,10 +1525,21 @@ def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_
     # Build compact claim summary grouped by section (if available), then by type
     claim_summary = {}
     section_summary = {}
+    visual_assets = []  # tables and figures available for slides
     for c in claims:
         ctype = c.get('claim_type', 'unknown')
         tags = c.get('tags') or []
         claim_summary.setdefault(ctype, set()).update(t.lower() for t in tags)
+        # Track visual assets (tables/figures)
+        content_format = c.get('content_format', 'text')
+        if content_format in ('table', 'figure'):
+            visual_assets.append({
+                'id': c.get('id'),
+                'content_format': content_format,
+                'text': c.get('text', ''),
+                'section': c.get('section'),
+                'page_number': c.get('page_number'),
+            })
         # Group by section if available
         section = c.get('section')
         if section:
@@ -1519,6 +1558,8 @@ def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_
     if section_summary:
         context_parts.append(f"<claims_by_section>\n{json.dumps(section_summary, indent=2)}\n</claims_by_section>")
     context_parts.append(f"<available_claim_types>\n{json.dumps(claim_summary, indent=2)}\n</available_claim_types>")
+    if visual_assets:
+        context_parts.append(f"<visual_assets>\n{json.dumps(visual_assets, indent=2)}\n</visual_assets>")
     if brand_guidelines:
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
     if target_audience:
@@ -1551,21 +1592,38 @@ def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_
 def _prefilter_claims(claims, slide_plan):
     """Step 1a: Programmatic pre-filter — narrow claims by type and keyword overlap."""
     target_types = set(t.lower() for t in slide_plan.get('claim_types', []))
-    keywords = set(k.lower() for k in slide_plan.get('keywords', []))
+    # Expand compound keywords: "overall_survival" → {"overall_survival", "overall", "survival"}
+    keywords = set()
+    for k in slide_plan.get('keywords', []):
+        kl = k.lower()
+        keywords.add(kl)
+        if '_' in kl:
+            keywords.update(kl.split('_'))
     target_section = (slide_plan.get('section') or '').lower().strip()
 
-    scored = []
+    content_scored = []
+    isi_claims = []
     for c in claims:
         ctype = (c.get('claim_type') or '').lower()
-        tags = set(t.lower() for t in (c.get('tags') or []))
+        # Normalize tags: split multi-word tags into individual tokens too
+        raw_tags = set(t.lower() for t in (c.get('tags') or []))
+        tags = set(raw_tags)
+        for t in raw_tags:
+            tags.update(t.split())
+        content_format = c.get('content_format', 'text')
 
-        # Always include ISI/boilerplate claims
+        # Collect ISI/boilerplate separately (capped later, not competing for content slots)
         if ctype in ('isi', 'boilerplate'):
-            scored.append((c, 100))
+            isi_claims.append(c)
             continue
 
+        # Visual claims (tables/figures) get boosted scoring — they're high-value
+        # and their short captions shouldn't penalize them
+        is_visual = content_format in ('table', 'figure')
+
         # Must match at least one target type (if types specified)
-        if target_types and ctype not in target_types:
+        # Visual claims bypass the type filter since they're always 'stat'
+        if target_types and ctype not in target_types and not is_visual:
             continue
 
         # Score by keyword overlap with tags + text keywords
@@ -1579,12 +1637,28 @@ def _prefilter_claims(claims, slide_plan):
         if target_section and claim_section and target_section in claim_section:
             score += 10
 
-        if score > 0 or not keywords:
-            scored.append((c, score))
+        # Boost visual claims — any keyword match in their caption is highly relevant
+        if is_visual and (text_overlap > 0 or tag_overlap > 0):
+            score += 8
+        # Visual claims in matching section always included even with zero keyword overlap
+        elif is_visual and target_section and claim_section and target_section in claim_section:
+            score += 5
 
-    # Sort by score descending, take top 20
-    scored.sort(key=lambda x: x[1], reverse=True)
-    return [c for c, _ in scored[:20]]
+        if score > 0 or not keywords:
+            content_scored.append((c, score))
+
+    # Take top 17 content claims + up to 3 ISI/boilerplate
+    content_scored.sort(key=lambda x: x[1], reverse=True)
+    result = [c for c, _ in content_scored[:17]] + isi_claims[:3]
+
+    # Debug: log top candidates with scores
+    for c, s in content_scored[:17]:
+        fmt = c.get('content_format', 'text')
+        label = f" [{fmt}]" if fmt != 'text' else ''
+        print(f"[DEBUG] Prefilter candidate (score={s}): {c.get('id', '?')}{label} — {c.get('text', '')[:80]}")
+    if isi_claims:
+        print(f"[DEBUG] Prefilter: {len(isi_claims)} ISI/boilerplate claims, including top {min(3, len(isi_claims))}")
+    return result
 
 
 def _select_claims(slide_topic, candidate_claims):
@@ -1597,6 +1671,7 @@ def _select_claims(slide_topic, candidate_claims):
             "text": c['text'],
             "type": c.get('claim_type', ''),
             "tags": c.get('tags') or [],
+            "content_format": c.get('content_format', 'text'),
         }
         for c in candidate_claims
     ]
@@ -1639,14 +1714,20 @@ def _build_slide(slide_topic, selected_claims, all_claims, brand_guidelines, com
         cid = sel['claim_id']
         claim = claims_by_id.get(cid)
         if claim:
-            selected_full.append({
+            entry = {
                 "claim_id": cid,
                 "role": sel['role'],
                 "text": claim['text'],
                 "type": claim.get('claim_type', ''),
                 "tags": claim.get('tags') or [],
                 "numeric_values": claim.get('numeric_values') or [],
-            })
+                "content_format": claim.get('content_format', 'text'),
+            }
+            if claim.get('table_markdown'):
+                entry["table_markdown"] = claim['table_markdown']
+            if claim.get('figure_url'):
+                entry["figure_url"] = claim['figure_url']
+            selected_full.append(entry)
 
     # Guard: if no valid claims resolved, return a title_only slide with no claim refs
     if not selected_full:

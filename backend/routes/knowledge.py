@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify, request, current_app, Response
 from werkzeug.utils import secure_filename
 from extensions import db
 from models import KnowledgeItem, Claim
-from services.pdf_service import extract_text_from_pdf, extract_text_by_page, extract_document_outline
+from services.pdf_service import extract_text_from_pdf, extract_text_by_page, parse_document_docling
 from services.claim_extractor import extract_claims_streaming, assign_sections_to_claims
 
 logger = logging.getLogger(__name__)
@@ -32,8 +32,9 @@ def list_knowledge():
     return jsonify(result)
 
 
-def _run_extraction(app, item_id, pages):
-    """Background thread: extract claims page-by-page and write to DB."""
+def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=None):
+    """Background thread: extract claims page-by-page and write to DB,
+    then create table and figure claims from Docling output."""
     with app.app_context():
         try:
             item = db.session.get(KnowledgeItem, item_id)
@@ -72,6 +73,72 @@ def _run_extraction(app, item_id, pages):
 
             claims_data = extract_claims_streaming(pages, item_id, app, on_page_done=on_page_done)
 
+            # Create table claims from Docling output
+            if docling_tables:
+                from services.claim_extractor import _make_id
+                table_claim_dicts = []
+                for t_idx, tbl in enumerate(docling_tables):
+                    claim_id = _make_id(tbl['caption'], 'stat', 90000 + t_idx)
+                    existing = db.session.get(Claim, claim_id)
+                    if not existing:
+                        claim_dict = {
+                            'text': tbl['caption'],
+                            'claim_type': 'stat',
+                            'page_number': tbl['page_number'],
+                            'section': tbl.get('section'),
+                        }
+                        table_claim_dicts.append(claim_dict)
+                        db.session.add(Claim(
+                            id=claim_id,
+                            knowledge_id=item_id,
+                            text=tbl['caption'],
+                            claim_type='stat',
+                            content_format='table',
+                            table_markdown=tbl['markdown'],
+                            page_number=tbl['page_number'],
+                            section=tbl.get('section'),
+                            tags=['table'],
+                            is_approved=True,
+                        ))
+                if doc_outline and table_claim_dicts:
+                    assign_sections_to_claims(table_claim_dicts, doc_outline)
+                db.session.commit()
+                logger.info("Created %d table claims for item %d", len(docling_tables), item_id)
+
+            # Create figure claims from Docling output
+            if docling_figures:
+                from services.claim_extractor import _make_id
+                figure_claim_dicts = []
+                for f_idx, fig in enumerate(docling_figures):
+                    caption = fig.get('caption') or f"Figure {f_idx + 1}"
+                    figure_url = fig.get('figure_url', '')
+                    claim_id = _make_id(caption, 'stat', 80000 + f_idx)
+                    existing = db.session.get(Claim, claim_id)
+                    if not existing:
+                        claim_dict = {
+                            'text': caption,
+                            'claim_type': 'stat',
+                            'page_number': fig['page_number'],
+                            'section': fig.get('section'),
+                        }
+                        figure_claim_dicts.append(claim_dict)
+                        db.session.add(Claim(
+                            id=claim_id,
+                            knowledge_id=item_id,
+                            text=caption,
+                            claim_type='stat',
+                            content_format='figure',
+                            figure_url=figure_url,
+                            page_number=fig['page_number'],
+                            section=fig.get('section'),
+                            tags=['figure'],
+                            is_approved=True,
+                        ))
+                if doc_outline and figure_claim_dicts:
+                    assign_sections_to_claims(figure_claim_dicts, doc_outline)
+                db.session.commit()
+                logger.info("Created %d figure claims for item %d", len(docling_figures), item_id)
+
             item = db.session.get(KnowledgeItem, item_id)
             item.extraction_status = 'complete'
             db.session.commit()
@@ -108,9 +175,11 @@ def upload_knowledge():
     filepath = os.path.join(upload_dir, filename)
     file.save(filepath)
 
-    text_content = extract_text_from_pdf(filepath)
-    pages = extract_text_by_page(filepath)
-    doc_outline = extract_document_outline(filepath)
+    # Single Docling pass: structured text, tables, figures, outline
+    docling_result = parse_document_docling(filepath, upload_dir)
+    pages = docling_result["pages"]
+    doc_outline = docling_result["doc_outline"]
+    text_content = "\n\n".join(p["text"] for p in pages)
 
     item = KnowledgeItem(
         title=title,
@@ -120,14 +189,22 @@ def upload_knowledge():
         doc_type=doc_type,
         doc_outline=doc_outline,
         extraction_status='extracting',
-        total_pages=len(pages),
+        total_pages=docling_result["total_pages"],
     )
     db.session.add(item)
     db.session.commit()
 
-    # Kick off background extraction
+    # Kick off background extraction with Docling tables/figures
     app = current_app._get_current_object()
-    t = threading.Thread(target=_run_extraction, args=(app, item.id, pages), daemon=True)
+    t = threading.Thread(
+        target=_run_extraction,
+        args=(app, item.id, pages),
+        kwargs={
+            'docling_tables': docling_result["tables"],
+            'docling_figures': docling_result["figures"],
+        },
+        daemon=True,
+    )
     t.start()
 
     result = item.to_dict()

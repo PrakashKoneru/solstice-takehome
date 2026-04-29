@@ -43,6 +43,12 @@ _CLAIM_SPAN_RE = re.compile(
     r'<span[^>]*data-claim-id="([^"]+)"[^>]*>(.*?)</span>',
     re.DOTALL,
 )
+_CLAIM_DIV_RE = re.compile(
+    r'<div[^>]*data-claim-id="([^"]+)"[^>]*>',
+)
+_CLAIM_IMG_RE = re.compile(
+    r'<img[^>]*data-claim-id="([^"]+)"[^>]*src="([^"]*)"[^>]*/?>',
+)
 _TAG_RE = re.compile(r'<[^>]+>')
 _WS_RE = re.compile(r'\s+')
 
@@ -60,10 +66,12 @@ def _normalize_claim_text(s: str) -> str:
 
 
 def _detect_claim_drift(html: str, claims_by_id: dict) -> list:
-    """Walk the HTML for claim-locked spans and compare their text to the
+    """Walk the HTML for claim-locked elements and compare to the
     authoritative claim catalog. Returns a list of drift flags."""
     flags = []
     seen = set()
+
+    # Check text claims (spans)
     for match in _CLAIM_SPAN_RE.finditer(html):
         cid = match.group(1)
         if cid in seen:
@@ -76,17 +84,57 @@ def _detect_claim_drift(html: str, claims_by_id: dict) -> list:
                 'note': f'Claim ID "{cid}" not found in approved catalog.',
             })
             continue
-        rendered = _normalize_claim_text(match.group(2))
-        expected = _normalize_claim_text(claims_by_id[cid].get('text', ''))
-        if rendered != expected:
+        claim = claims_by_id[cid]
+        content_format = claim.get('content_format', 'text')
+        if content_format == 'text':
+            rendered = _normalize_claim_text(match.group(2))
+            expected = _normalize_claim_text(claim.get('text', ''))
+            if rendered != expected:
+                flags.append({
+                    'claim': cid,
+                    'status': 'unsupported',
+                    'note': (
+                        f'Rendered text diverged from approved claim. '
+                        f'Expected: "{expected[:120]}". Got: "{rendered[:120]}".'
+                    ),
+                })
+
+    # Check table claims (divs with data-claim-id) — presence check only
+    for match in _CLAIM_DIV_RE.finditer(html):
+        cid = match.group(1)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if cid not in claims_by_id:
             flags.append({
                 'claim': cid,
                 'status': 'unsupported',
-                'note': (
-                    f'Rendered text diverged from approved claim. '
-                    f'Expected: "{expected[:120]}". Got: "{rendered[:120]}".'
-                ),
+                'note': f'Claim ID "{cid}" not found in approved catalog.',
             })
+
+    # Check figure claims (imgs with data-claim-id) — verify src matches figure_url
+    for match in _CLAIM_IMG_RE.finditer(html):
+        cid = match.group(1)
+        rendered_src = match.group(2)
+        if cid in seen:
+            continue
+        seen.add(cid)
+        if cid not in claims_by_id:
+            flags.append({
+                'claim': cid,
+                'status': 'unsupported',
+                'note': f'Claim ID "{cid}" not found in approved catalog.',
+            })
+            continue
+        claim = claims_by_id[cid]
+        expected_url = claim.get('figure_url', '')
+        if expected_url and rendered_src != expected_url:
+            flags.append({
+                'claim': cid,
+                'status': 'unsupported',
+                'note': f'Figure src diverged. Expected: "{expected_url[:120]}". Got: "{rendered_src[:120]}".',
+            })
+
     return flags
 
 

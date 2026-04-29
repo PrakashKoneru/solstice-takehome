@@ -144,6 +144,9 @@ class Claim(db.Model):
     text            = db.Column(db.Text, nullable=False)           # verbatim, immutable after approval
     claim_type      = db.Column(db.String(32), nullable=False)
     # efficacy | safety | dosing | moa | isi | boilerplate | stat | study_design | indication | nccn
+    content_format  = db.Column(db.String(16), nullable=False, default='text')  # text | table | figure
+    table_markdown  = db.Column(db.Text, nullable=True)
+    figure_url      = db.Column(db.String(500), nullable=True)
     source_citation = db.Column(db.String(255), nullable=True)
     page_number     = db.Column(db.Integer, nullable=True)
     numeric_values  = db.Column(db.JSON, nullable=True)
@@ -159,6 +162,9 @@ class Claim(db.Model):
             'knowledge_id':    self.knowledge_id,
             'text':            self.text,
             'claim_type':      self.claim_type,
+            'content_format':  self.content_format or 'text',
+            'table_markdown':  self.table_markdown,
+            'figure_url':      self.figure_url,
             'source_citation': self.source_citation,
             'page_number':     self.page_number,
             'numeric_values':  self.numeric_values or [],

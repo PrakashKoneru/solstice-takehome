@@ -500,6 +500,186 @@ def extract_assets_from_pdf(filepath: str, output_dir: str, brand_guidelines=Non
     return assets
 
 
+def parse_document_docling(filepath: str, upload_dir: str) -> dict:
+    """
+    Full Docling parse of a KB document. Returns structured text, tables, figures,
+    and document outline in a single pass.
+
+    Returns:
+        {
+            "pages": [{"page_number": 1, "text": "## Header\n\nParagraph...\n\n| col | col |..."}],
+            "doc_outline": [{"title": "Efficacy", "page": 3, "level": 1}],
+            "tables": [{"page_number": 5, "markdown": "| ... |", "caption": "Table 2: OS Results"}],
+            "figures": [{"page_number": 5, "image": <PIL.Image>, "caption": "...", "figure_url": "..."}],
+            "total_pages": 50,
+        }
+    """
+    import io
+    import json
+    import anthropic
+    from collections import defaultdict
+    from docling.document_converter import DocumentConverter, PdfFormatOption
+    from docling.datamodel.pipeline_options import PdfPipelineOptions
+    from docling.datamodel.base_models import InputFormat
+    from docling.datamodel.document import (
+        SectionHeaderItem, TextItem, ListItem, TableItem, PictureItem,
+    )
+
+    print(f"[DOCLING-KB] Starting full document parse for: {filepath}")
+
+    pipeline_options = PdfPipelineOptions(
+        generate_picture_images=True,
+        images_scale=2.0,
+    )
+    converter = DocumentConverter(
+        format_options={
+            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
+        }
+    )
+    doc_result = converter.convert(filepath)
+
+    # Accumulators
+    page_texts = defaultdict(list)  # page_number -> list of text chunks
+    doc_outline = []
+    tables = []
+    figures = []
+    current_section = None
+    tbl_idx = 0
+
+    for item, _level in doc_result.document.iterate_items():
+        page_no = item.prov[0].page_no if item.prov else 0
+
+        if isinstance(item, SectionHeaderItem):
+            title = item.text.strip()
+            if title:
+                level = _level if isinstance(_level, int) and _level > 0 else 1
+                doc_outline.append({"title": title, "page": page_no, "level": level})
+                current_section = title
+                page_texts[page_no].append(f"## {title}")
+
+        elif isinstance(item, TextItem):
+            text = item.text.strip()
+            if text:
+                page_texts[page_no].append(text)
+
+        elif isinstance(item, ListItem):
+            text = item.text.strip()
+            if text:
+                page_texts[page_no].append(f"- {text}")
+
+        elif isinstance(item, TableItem):
+            tbl_idx += 1
+            try:
+                md = item.export_to_markdown()
+                caption = f"Table {tbl_idx}"
+                # Try to use preceding text as caption
+                page_content = page_texts.get(page_no, [])
+                if page_content:
+                    last_line = page_content[-1].strip()
+                    if last_line.lower().startswith("table") or len(last_line) < 120:
+                        caption = last_line
+                tables.append({
+                    "page_number": page_no,
+                    "markdown": md,
+                    "caption": caption,
+                    "section": current_section,
+                })
+                # Embed table in page text too
+                page_texts[page_no].append(md)
+                print(f"[DOCLING-KB] Table {tbl_idx} from page {page_no}: {len(md)} chars")
+            except Exception as e:
+                print(f"[DOCLING-KB] Error exporting table {tbl_idx}: {e}")
+
+        elif isinstance(item, PictureItem):
+            img = item.get_image(doc_result.document)
+            if img is None:
+                continue
+            figures.append({
+                "page_number": page_no,
+                "image": img,
+                "caption": "",
+                "section": current_section,
+            })
+
+    # Label figures with Haiku vision and upload to Cloudinary
+    if figures:
+        print(f"[DOCLING-KB] Labeling and uploading {len(figures)} figures...")
+        try:
+            client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        except Exception:
+            client = None
+
+        for i, fig in enumerate(figures):
+            img = fig["image"]
+            # Upload to Cloudinary
+            fig_filename = f"kb_figure_p{fig['page_number']}_{i + 1}.png"
+            fig_path = os.path.join(upload_dir, fig_filename)
+            img.save(fig_path, format='PNG')
+
+            figure_url = fig_path
+            try:
+                upload_result = cloudinary.uploader.upload(
+                    fig_path,
+                    folder='solstice/kb_figures',
+                    public_id=f'kb_fig_p{fig["page_number"]}_{i + 1}',
+                    overwrite=True,
+                    resource_type='image',
+                )
+                figure_url = upload_result['secure_url']
+                print(f"[DOCLING-KB] Figure {i + 1} uploaded -> {figure_url}")
+            except Exception as e:
+                print(f"[DOCLING-KB] Figure {i + 1} Cloudinary upload failed: {e}")
+
+            fig["figure_url"] = figure_url
+
+            # Label with Haiku vision
+            if client:
+                try:
+                    buf = io.BytesIO()
+                    img.save(buf, format='PNG')
+                    b64 = base64.standard_b64encode(buf.getvalue()).decode()
+                    resp = client.messages.create(
+                        model='claude-haiku-4-5-20251001',
+                        max_tokens=128,
+                        messages=[{
+                            'role': 'user',
+                            'content': [
+                                {'type': 'image', 'source': {'type': 'base64', 'media_type': 'image/png', 'data': b64}},
+                                {'type': 'text', 'text': (
+                                    'What is this figure? Reply with ONLY a short label, e.g. '
+                                    '"Kaplan-Meier OS Curve, FRESCO-2" or "Waterfall Plot, Tumor Reduction". '
+                                    'No explanation.'
+                                )},
+                            ],
+                        }],
+                    )
+                    label = resp.content[0].text.strip()
+                    fig["caption"] = label
+                    print(f"[DOCLING-KB] Figure {i + 1} labeled: {label}")
+                except Exception as e:
+                    print(f"[DOCLING-KB] Figure {i + 1} labeling failed: {e}")
+
+    # Build pages list
+    total_pages = doc_result.document.num_pages() if hasattr(doc_result.document, 'num_pages') else max(page_texts.keys(), default=0)
+    pages = []
+    for pg in sorted(page_texts.keys()):
+        pages.append({
+            "page_number": pg,
+            "text": "\n\n".join(page_texts[pg]),
+        })
+
+    print(f"[DOCLING-KB] Done. {len(pages)} pages, {len(doc_outline)} outline entries, "
+          f"{len(tables)} tables, {len(figures)} figures")
+
+    return {
+        "pages": pages,
+        "doc_outline": doc_outline,
+        "tables": tables,
+        "figures": figures,
+        "total_pages": total_pages if isinstance(total_pages, int) else len(pages),
+    }
+
+
 def extract_tables_docling(filepath: str) -> list:
     """
     Extract structured table data from a PDF using docling's TableFormer.
