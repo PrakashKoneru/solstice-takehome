@@ -12,8 +12,7 @@ COPY requirements.txt .
 
 # Cache mount keeps the pip cache across builds so only new/changed
 # packages are downloaded. This is the key to beating the timeout.
-RUN --mount=type=cache,id=pip,target=/root/.cache/pip \
-    pip install --no-compile -r requirements.txt
+RUN pip install --no-compile -r requirements.txt
 
 # ── Runtime stage: copy only installed packages + app code ──
 FROM python:3.11-slim
