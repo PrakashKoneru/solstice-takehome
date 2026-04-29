@@ -182,6 +182,35 @@ def extract_claims_streaming(pages: list, knowledge_id: int, app, on_page_done=N
     return result
 
 
+def assign_sections_to_claims(claims: list, doc_outline: list) -> list:
+    """Post-process claims: assign section from doc_outline based on page_number.
+    Walks outline entries sorted by page, assigns the most recent level 1-2 header.
+    """
+    if not doc_outline:
+        return claims
+
+    # Sort outline by page, filter to level 1-2
+    sorted_outline = sorted(
+        [e for e in doc_outline if e.get('level', 1) <= 2],
+        key=lambda e: e.get('page', 0)
+    )
+    if not sorted_outline:
+        return claims
+
+    for claim in claims:
+        page = claim.get('page_number') or 0
+        section = None
+        for entry in sorted_outline:
+            if entry.get('page', 0) <= page:
+                section = entry.get('title')
+            else:
+                break
+        if section:
+            claim['section'] = section
+
+    return claims
+
+
 def extract_claims(text: str, knowledge_id: int) -> list:
     """
     Backward-compatible wrapper: extracts claims from full text.

@@ -631,14 +631,15 @@ function SessionPageInner() {
     }
   }
 
-  async function handleSend() {
-    if (!input.trim() || sending) return
+  async function handleSend(overrideMessage?: string) {
+    const messageText = overrideMessage || input.trim()
+    if (!messageText || sending) return
     if (selectedDocIds.size === 0) {
-      setMessages((prev) => [...prev, { role: 'user', content: input.trim() }, { role: 'assistant', content: 'Please select a Knowledge Base document before sending a message.' }])
+      setMessages((prev) => [...prev, { role: 'user', content: messageText }, { role: 'assistant', content: 'Please select a Knowledge Base document before sending a message.' }])
       setInput('')
       return
     }
-    const userMessage = input.trim()
+    const userMessage = messageText
     setInput('')
     setMessages((prev) => [...prev, { role: 'user', content: userMessage }])
     setSending(true)
@@ -1001,48 +1002,86 @@ function SessionPageInner() {
               <svg className="h-9 w-9 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M8 12h.01M12 12h.01M16 12h.01M21 12c0 4.418-4.03 8-9 8a9.863 9.863 0 01-4.255-.949L3 20l1.395-3.72C3.512 15.042 3 13.574 3 12c0-4.418 4.03-8 9-8s9 3.582 9 8z" />
               </svg>
-              <p className="text-sm">Describe what you want to generate.</p>
-              <p className="text-xs mt-1 max-w-xs">e.g. "Create a one-page efficacy slide for oncologists"</p>
-            </div>
-          )}
-          {messages.map((msg, i) => (
-            <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
-                msg.role === 'user'
-                  ? 'bg-indigo-600 text-white rounded-br-sm'
-                  : 'bg-slate-100 text-slate-800 rounded-bl-sm'
-              }`}>
-                {msg.role === 'assistant' ? (
-                  <ReactMarkdown
-                    components={{
-                      p: ({ children }) => <p className="mb-1 last:mb-0">{children}</p>,
-                      strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
-                      ul: ({ children }) => <ul className="list-disc pl-4 mb-1">{children}</ul>,
-                      ol: ({ children }) => <ol className="list-decimal pl-4 mb-1">{children}</ol>,
-                      li: ({ children }) => <li className="mb-0.5">{children}</li>,
-                      hr: () => <hr className="my-2 border-slate-300" />,
-                      table: ({ children }) => <table className="text-xs border-collapse w-full my-1">{children}</table>,
-                      th: ({ children }) => <th className="border border-slate-300 px-2 py-1 bg-slate-200 font-semibold">{children}</th>,
-                      td: ({ children }) => <td className="border border-slate-300 px-2 py-1">{children}</td>,
-                    }}
+              <p className="text-sm font-medium text-slate-500 mb-3">What would you like to create?</p>
+              <div className="flex flex-wrap gap-2 max-w-xs justify-center">
+                {[
+                  'What content is available?',
+                  'Create an efficacy overview deck',
+                  'Build a safety summary slide',
+                ].map((chip) => (
+                  <button
+                    key={chip}
+                    onClick={() => handleSend(chip)}
+                    className="inline-flex items-center gap-1.5 rounded-full border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 hover:border-indigo-300 hover:text-indigo-600 hover:bg-indigo-50 transition-colors shadow-sm"
                   >
-                    {msg.content}
-                  </ReactMarkdown>
-                ) : msg.content}
+                    {chip}
+                  </button>
+                ))}
               </div>
             </div>
-          ))}
-          {sending && (
-            <div className="flex justify-start">
-              <div className="bg-slate-100 rounded-2xl rounded-bl-sm px-4 py-3">
-                <div className="flex gap-1 items-center">
-                  <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '0ms' }} />
-                  <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '150ms' }} />
-                  <span className="h-1.5 w-1.5 rounded-full bg-slate-400 animate-bounce" style={{ animationDelay: '300ms' }} />
-                  {streamStatus && (
-                    <span className="ml-2 text-xs text-slate-500">{streamStatus}</span>
+          )}
+          {messages.map((msg, i) => {
+            const isLastAssistant = msg.role === 'assistant' && i === messages.length - 1 && !sending
+            return (
+              <div key={i} className={`group flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                <div className="flex flex-col">
+                  <div className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+                    msg.role === 'user'
+                      ? 'bg-indigo-600 text-white rounded-br-sm'
+                      : 'bg-slate-100 text-slate-800 rounded-bl-sm'
+                  }`}>
+                    {msg.role === 'assistant' ? (
+                      <ReactMarkdown
+                        components={{
+                          p: ({ children }) => <p className="mb-1 last:mb-0">{children}</p>,
+                          strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
+                          ul: ({ children }) => <ul className="list-disc pl-4 mb-1">{children}</ul>,
+                          ol: ({ children }) => <ol className="list-decimal pl-4 mb-1">{children}</ol>,
+                          li: ({ children }) => <li className="mb-0.5">{children}</li>,
+                          hr: () => <hr className="my-2 border-slate-300" />,
+                          table: ({ children }) => <table className="text-xs border-collapse w-full my-1">{children}</table>,
+                          th: ({ children }) => <th className="border border-slate-300 px-2 py-1 bg-slate-200 font-semibold">{children}</th>,
+                          td: ({ children }) => <td className="border border-slate-300 px-2 py-1">{children}</td>,
+                        }}
+                      >
+                        {msg.content}
+                      </ReactMarkdown>
+                    ) : msg.content}
+                  </div>
+                  {isLastAssistant && (
+                    <button
+                      onClick={() => {
+                        // Find the last user message and re-send it
+                        const lastUserMsg = [...messages].reverse().find((m) => m.role === 'user')
+                        if (lastUserMsg) {
+                          setMessages((prev) => prev.slice(0, -1))
+                          handleSend(lastUserMsg.content)
+                        }
+                      }}
+                      className="mt-1 self-start opacity-0 group-hover:opacity-100 transition-opacity inline-flex items-center gap-1 rounded-md px-2 py-1 text-xs text-slate-400 hover:text-slate-600 hover:bg-slate-100"
+                      title="Regenerate response"
+                    >
+                      <svg className="h-3 w-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                      </svg>
+                      Regenerate
+                    </button>
                   )}
                 </div>
+              </div>
+            )
+          })}
+          {sending && (
+            <div className="flex justify-start">
+              <div className="bg-slate-100 rounded-2xl rounded-bl-sm px-4 py-3 min-w-[160px]">
+                <div className="flex gap-1.5 items-center">
+                  <span className="h-1.5 w-1.5 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: '0ms' }} />
+                  <span className="h-1.5 w-1.5 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: '150ms' }} />
+                  <span className="h-1.5 w-1.5 rounded-full bg-indigo-400 animate-bounce" style={{ animationDelay: '300ms' }} />
+                </div>
+                {streamStatus && (
+                  <p className="mt-1.5 text-xs font-medium text-slate-500">{streamStatus}</p>
+                )}
               </div>
             </div>
           )}

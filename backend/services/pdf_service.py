@@ -4,6 +4,61 @@ import cloudinary
 import cloudinary.uploader
 
 
+def extract_document_outline(filepath: str) -> list:
+    """Extract document outline (TOC) from a PDF.
+    Returns [{"title": "...", "page": N, "level": N}, ...].
+    Falls back to Haiku-based header detection if no TOC is present.
+    """
+    try:
+        import fitz
+        doc = fitz.open(filepath)
+        toc = doc.get_toc()
+        if toc:
+            outline = [{"title": entry[1].strip(), "page": entry[2], "level": entry[0]}
+                       for entry in toc if entry[1].strip()]
+            print(f"[OUTLINE] Extracted outline from TOC: {[e['title'] for e in outline]}")
+            return outline
+    except Exception as e:
+        print(f"[OUTLINE] PyMuPDF TOC extraction failed: {e}")
+
+    # Fallback: use first 5 pages + Haiku to identify section headers
+    try:
+        import os
+        import json
+        import anthropic
+        pages = extract_text_by_page(filepath)
+        sample_text = "\n\n".join(
+            f"--- Page {p['page_number']} ---\n{p['text'][:2000]}"
+            for p in pages[:5]
+        )
+        client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        resp = client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=1024,
+            messages=[{
+                'role': 'user',
+                'content': (
+                    f"Identify the major section headers from this document excerpt. "
+                    f"Return ONLY a JSON array of objects with 'title', 'page', and 'level' fields.\n\n"
+                    f"{sample_text}"
+                ),
+            }],
+        )
+        raw = resp.content[0].text.strip()
+        if raw.startswith('```'):
+            raw = raw.split('```')[1]
+            if raw.startswith('json'):
+                raw = raw[4:]
+        outline = json.loads(raw)
+        if isinstance(outline, list):
+            print(f"[OUTLINE] Extracted outline via Haiku: {[e.get('title') for e in outline]}")
+            return outline
+    except Exception as e:
+        print(f"[OUTLINE] Haiku fallback failed: {e}")
+
+    return []
+
+
 def extract_text_by_page(filepath: str) -> list:
     """Return [{"page_number": 1, "text": "..."}, ...] for each page."""
     try:

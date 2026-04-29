@@ -77,6 +77,16 @@ You help the user plan, refine, and discuss their slide deck. You MUST NEVER out
 CONTEXT AWARENESS:
 You have full visibility into this session's conversation history. The history shows "[slides generated]" wherever a slide was produced — that means slides exist in the output panel. When a user references "the current slide" or "slide 2", acknowledge what has been built. Never tell the user you cannot see their slides or documents.
 
+DOCUMENT NAVIGATION:
+When <document_outline> is provided, you know the KB document's section structure.
+Use it to help the user explore what content is available. When they ask about a section, reference it by name. Suggest specific sections that would make good slides.
+
+ASSET AWARENESS:
+When <brand_assets> is provided, reference available logos, icons, and graphics by name when discussing layouts or design options.
+
+DECK AWARENESS:
+When <current_deck> is provided, you know what slides exist. Reference them by title and layout type. Suggest improvements to specific slides.
+
 BRAND GUIDELINES — strict sourcing rule:
 When answering questions about brand guidelines, design rules, or what is/isn't allowed:
 - ONLY cite rules that are explicitly present in the <brand_guidelines> JSON provided to you.
@@ -382,15 +392,23 @@ def chat_response(
     target_audience: Optional[str] = None,
     audience_rules: Optional[dict] = None,
     component_patterns: Optional[dict] = None,
+    doc_outline: Optional[list] = None,
+    current_spec: Optional[dict] = None,
 ) -> str:
     client = _get_client()
     context_parts = []
+    if doc_outline:
+        context_parts.append(f"<document_outline>\n{json.dumps(doc_outline, indent=2)}\n</document_outline>")
+    if current_spec:
+        deck_summary = [{"title": s.get("slide_title", ""), "layout": s.get("layout", "")}
+                        for s in current_spec.get("slides", [])]
+        context_parts.append(f"<current_deck>\n{json.dumps(deck_summary, indent=2)}\n</current_deck>")
     if brand_guidelines:
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
     if component_patterns:
         context_parts.append(f"<component_patterns>\n{json.dumps(component_patterns, indent=2)}\n</component_patterns>")
     if ds_assets:
-        asset_list = [{'name': a['name'], 'type': a['asset_type']} for a in ds_assets]
+        asset_list = [{'name': a['name'], 'type': a['asset_type'], 'url': a['file_url']} for a in ds_assets]
         context_parts.append(f"<brand_assets>\n{json.dumps(asset_list, indent=2)}\n</brand_assets>")
     if kb_texts:
         combined = "\n\n---\n\n".join(kb_texts)
@@ -879,7 +897,20 @@ HARD RULES:
 - slide_title and cta_text may be rendered with creative typography but their wording is also fixed.
 - You MUST apply the brand's full visual language: gradients, decorative elements, icons, typography hierarchy, color treatments — everything that makes the brand come alive.
 - Follow the layout type specified for each slide but express it through the brand's design language, not a generic template.
-- IMPORTANT: Every claim text element MUST be wrapped in a span with data-claim-id and contenteditable="false": <span data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked">CLAIM TEXT</span>. This applies to headline text, body claim text, and footer claim text. The claim_id is provided alongside each text field in the spec."""
+- IMPORTANT: Every claim text element MUST be wrapped in a span with data-claim-id and contenteditable="false": <span data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked">CLAIM TEXT</span>. This applies to headline text, body claim text, and footer claim text. The claim_id is provided alongside each text field in the spec.
+
+BRAND ASSET USAGE:
+- If a slide has logo_url, place it per brand guidelines positioning rules (typically top-right or top-left of the header area).
+- Use exact asset URLs from the spec — never construct or guess URLs.
+
+DESIGN TOKEN APPLICATION:
+- Use <design_tokens> colors for ALL color values — never hardcode hex values that aren't from the token palette.
+- Use <design_tokens> fonts for ALL font-family values.
+- Apply typography contextual rules from <component_patterns> when available.
+
+LAYOUT FIDELITY:
+- If matched_pattern is provided on a slide, follow its spatial structure exactly — regions, columns, proportions, spacing.
+- Cross-reference component_patterns.patterns for exact CSS properties when rendering individual elements."""
 )
 
 
@@ -899,6 +930,20 @@ def render_spec_to_html(
     """
     client = _get_client()
 
+    # Pre-resolve logo URL from brand assets
+    logo_url = None
+    if ds_assets:
+        for a in ds_assets:
+            if a.get('asset_type') == 'logo':
+                logo_url = a.get('file_url')
+                break
+
+    # Match slide layouts to component_patterns slideLayouts
+    layout_patterns = {}
+    if component_patterns and component_patterns.get('slideLayouts'):
+        for sl in component_patterns['slideLayouts']:
+            layout_patterns[sl.get('name', '').lower()] = sl
+
     # Resolve claim IDs to verbatim text inline
     resolved = {"slides": []}
     for slide in spec.get("slides", []):
@@ -907,6 +952,14 @@ def render_spec_to_html(
             "slide_title": slide.get("slide_title", ""),
             "cta_text": slide.get("cta_text", ""),
         }
+        if logo_url:
+            s["logo_url"] = logo_url
+        # Match layout to component pattern
+        layout_name = (slide.get("layout") or "").lower().replace("_", " ")
+        for pattern_name, pattern_data in layout_patterns.items():
+            if layout_name in pattern_name.lower() or pattern_name.lower() in layout_name:
+                s["matched_pattern"] = pattern_data
+                break
         h = slide.get("headline", {})
         hid = h.get("claim_id")
         s["headline"] = {
@@ -1248,6 +1301,10 @@ NARRATIVE_PLAN_TOOL = {
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Key terms for claim filtering (e.g. 'OS', 'PFS', 'adverse events')"
+                        },
+                        "section": {
+                            "type": "string",
+                            "description": "The document section this slide draws from (from the document outline, if available)"
                         }
                     },
                     "required": ["topic", "claim_types", "keywords"]
@@ -1358,11 +1415,14 @@ NARRATIVE_PLAN_SYSTEM = """You are a pharma slide deck narrative planner. Given 
 
 Each topic is a short description of the slide's intent (e.g. "Overall survival primary endpoint", "Safety profile overview"). For each topic, specify which claim types are relevant and key terms for filtering claims.
 
+When <document_outline> is provided, use it to understand the source document's structure. When the user references a section by name, map it directly to the matching outline entry and set the "section" field on the corresponding slide plan. This ensures claims from the correct document section are prioritized.
+
 Guidelines:
 - Start with a hero/title slide if the request implies a full deck
 - Group related data logically (efficacy → safety → dosing)
 - Keep the deck focused — 4-8 slides for a typical request
-- Include ISI/safety information where clinically appropriate"""
+- Include ISI/safety information where clinically appropriate
+- When the document outline is available, use its section names in the "section" field to ground each slide in a specific part of the document"""
 
 SELECT_CLAIMS_SYSTEM = """You are a strict claim selector for pharma slides. Given a slide topic and candidate claims, select ONLY the claims that are directly relevant to this specific slide topic. Err on the side of fewer, more relevant claims.
 
@@ -1430,20 +1490,34 @@ EMPHASIS — set after layout is decided:
   footer claims: never set emphasis"""
 
 
-def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_rules, history):
+def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_rules, history, doc_outline=None):
     """Step 0: Plan the narrative arc — produces ordered slide topics."""
     client = _get_client()
 
-    # Build compact claim summary (types + tags only, not full text)
+    # Build compact claim summary grouped by section (if available), then by type
     claim_summary = {}
+    section_summary = {}
     for c in claims:
         ctype = c.get('claim_type', 'unknown')
         tags = c.get('tags') or []
         claim_summary.setdefault(ctype, set()).update(t.lower() for t in tags)
+        # Group by section if available
+        section = c.get('section')
+        if section:
+            sec_data = section_summary.setdefault(section, {})
+            sec_data.setdefault('claim_types', set()).add(ctype)
+            sec_data.setdefault('tags', set()).update(t.lower() for t in tags)
     # Convert sets to lists for JSON serialization
     claim_summary = {k: sorted(v) for k, v in claim_summary.items()}
+    for sec in section_summary.values():
+        sec['claim_types'] = sorted(sec['claim_types'])
+        sec['tags'] = sorted(sec['tags'])
 
     context_parts = []
+    if doc_outline:
+        context_parts.append(f"<document_outline>\n{json.dumps(doc_outline, indent=2)}\n</document_outline>")
+    if section_summary:
+        context_parts.append(f"<claims_by_section>\n{json.dumps(section_summary, indent=2)}\n</claims_by_section>")
     context_parts.append(f"<available_claim_types>\n{json.dumps(claim_summary, indent=2)}\n</available_claim_types>")
     if brand_guidelines:
         context_parts.append(f"<brand_guidelines>\n{json.dumps(brand_guidelines, indent=2)}\n</brand_guidelines>")
@@ -1478,6 +1552,7 @@ def _prefilter_claims(claims, slide_plan):
     """Step 1a: Programmatic pre-filter — narrow claims by type and keyword overlap."""
     target_types = set(t.lower() for t in slide_plan.get('claim_types', []))
     keywords = set(k.lower() for k in slide_plan.get('keywords', []))
+    target_section = (slide_plan.get('section') or '').lower().strip()
 
     scored = []
     for c in claims:
@@ -1498,6 +1573,11 @@ def _prefilter_claims(claims, slide_plan):
         tag_overlap = len(keywords & tags)
         text_overlap = len(keywords & text_tokens)
         score = tag_overlap * 3 + text_overlap  # tags weighted higher
+
+        # Heavily boost claims from matching document section
+        claim_section = (c.get('section') or '').lower().strip()
+        if target_section and claim_section and target_section in claim_section:
+            score += 10
 
         if score > 0 or not keywords:
             scored.append((c, score))
@@ -1639,6 +1719,7 @@ def generate_slide_spec(
     history: Optional[list] = None,
     component_patterns: Optional[dict] = None,
     on_slide_ready: Optional[Callable] = None,
+    doc_outline: Optional[list] = None,
 ) -> dict:
     """
     Incremental per-slide generation pipeline.
@@ -1647,7 +1728,8 @@ def generate_slide_spec(
     """
     # Step 0: Plan narrative
     plan = _plan_narrative(prompt, claims, brand_guidelines,
-                           target_audience, audience_rules, history)
+                           target_audience, audience_rules, history,
+                           doc_outline=doc_outline)
 
     slide_plans = plan.get('slides', [])
 

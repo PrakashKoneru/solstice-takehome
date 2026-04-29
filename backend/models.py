@@ -55,6 +55,7 @@ class KnowledgeItem(db.Model):
     file_path    = db.Column(db.String(500), nullable=False)
     text_content = db.Column(db.Text, nullable=True)
     doc_type           = db.Column(db.String(50), nullable=False, default='general')
+    doc_outline        = db.Column(db.JSON, nullable=True)
     extraction_status  = db.Column(db.String(20), default='pending')
     total_pages        = db.Column(db.Integer, nullable=True)
     created_at         = db.Column(db.DateTime, default=datetime.utcnow)
@@ -66,6 +67,7 @@ class KnowledgeItem(db.Model):
             'title':             self.title,
             'filename':          self.filename,
             'doc_type':          self.doc_type,
+            'doc_outline':       self.doc_outline or [],
             'extraction_status': self.extraction_status,
             'total_pages':       self.total_pages,
             'created_at':        self.created_at.isoformat(),
@@ -147,6 +149,7 @@ class Claim(db.Model):
     numeric_values  = db.Column(db.JSON, nullable=True)
     # [{"value": "7.4", "unit": "months", "label": "median OS (FRUZAQLA)"}]
     tags            = db.Column(db.JSON, nullable=True)
+    section         = db.Column(db.String(255), nullable=True)
     is_approved     = db.Column(db.Boolean, default=True, nullable=False)
     created_at      = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -160,6 +163,7 @@ class Claim(db.Model):
             'page_number':     self.page_number,
             'numeric_values':  self.numeric_values or [],
             'tags':            self.tags or [],
+            'section':         self.section,
             'is_approved':     self.is_approved,
             'created_at':      self.created_at.isoformat(),
         }
