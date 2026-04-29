@@ -146,6 +146,7 @@ class Claim(db.Model):
     # efficacy | safety | dosing | moa | isi | boilerplate | stat | study_design | indication | nccn
     content_format  = db.Column(db.String(16), nullable=False, default='text')  # text | table | figure
     table_markdown  = db.Column(db.Text, nullable=True)
+    table_json      = db.Column(db.JSON, nullable=True)           # {"headers": [...], "rows": [[...], ...]}
     figure_url      = db.Column(db.String(500), nullable=True)
     source_citation = db.Column(db.String(255), nullable=True)
     page_number     = db.Column(db.Integer, nullable=True)
@@ -164,6 +165,7 @@ class Claim(db.Model):
             'claim_type':      self.claim_type,
             'content_format':  self.content_format or 'text',
             'table_markdown':  self.table_markdown,
+            'table_json':      self.table_json,
             'figure_url':      self.figure_url,
             'source_citation': self.source_citation,
             'page_number':     self.page_number,

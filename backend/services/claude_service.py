@@ -795,7 +795,14 @@ def _tag_filter(catalog: list, prompt: str, max_claims: int = 60) -> list:
     return result[:max_claims]
 
 
-_FREE_TEXT_RE = re.compile(r'[\d%]|(\bvs\b|\bcompared\b|\bhigher\b|\blower\b|\bgreater\b|\breduction\b|\bincrease\b)', re.IGNORECASE)
+# Match standalone numbers (e.g. "34%", "7.4 months") but NOT digits embedded in
+# study names like "FRESCO-2", "NCT04322539", or "Phase 3".
+_FREE_TEXT_RE = re.compile(
+    r'(?<![A-Za-z-])\d+\.?\d*\s*%'           # percentages: "34%", "7.4%"
+    r'|(?<![A-Za-z-])\d+\.?\d*\s+(?:months|years|days|mg|patients)'  # numbers with units
+    r'|(\bvs\b|\bcompared\b|\bhigher\b|\blower\b|\bgreater\b|\breduction\b|\bincrease\b)',
+    re.IGNORECASE,
+)
 
 
 def validate_slide_spec(spec: dict, available_ids: list, brand_guidelines: Optional[dict] = None) -> list:
@@ -899,11 +906,16 @@ HARD RULES:
 - Follow the layout type specified for each slide but express it through the brand's design language, not a generic template.
 - IMPORTANT: Every claim text element MUST be wrapped in a span with data-claim-id and contenteditable="false": <span data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked">CLAIM TEXT</span>. This applies to headline text, body claim text, and footer claim text. The claim_id is provided alongside each text field in the spec.
 
-CONTENT FORMAT RENDERING:
-Body claims may have a "content_format" field. Render them as follows:
-- content_format: "text" (default) → render as <span data-claim-id contenteditable="false" class="claim-locked">CLAIM TEXT</span> (unchanged behavior)
-- content_format: "table" → render the table_markdown as a branded HTML table inside <div data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked">. Apply design token colors, fonts, and borders. Keep ALL cell values verbatim — never alter table data.
-- content_format: "figure" → render as <img src="FIGURE_URL" data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked" alt="CLAIM TEXT"> with branded framing (title bar with caption, subtle border consistent with design system).
+VISUAL CONTENT:
+Tables and figures are injected automatically AFTER you return your HTML. You will NOT see them in the spec.
+- If a body_claim says "(visual content will be placed here automatically)", leave generous empty space in that area — a full-width container with min-height. The visual will be inserted there.
+- Do NOT create placeholder text, fake tables, or dummy images. Just leave the space open.
+- IMPORTANT: slide content areas MUST NOT have overflow:hidden or fixed heights that would clip injected content. Use min-height and let content expand naturally.
+
+TEXT CLAIMS:
+Body claims with content_format "text" are rendered normally:
+- Wrap in <span data-claim-id="CLAIM_ID" contenteditable="false" class="claim-locked">CLAIM TEXT</span>
+- Render the text VERBATIM — do not alter, rephrase, or summarize.
 
 BRAND ASSET USAGE:
 - If a slide has logo_url, place it per brand guidelines positioning rules (typically top-right or top-left of the header area).
@@ -918,6 +930,82 @@ LAYOUT FIDELITY:
 - If matched_pattern is provided on a slide, follow its spatial structure exactly — regions, columns, proportions, spacing.
 - Cross-reference component_patterns.patterns for exact CSS properties when rendering individual elements."""
 )
+
+
+def _table_json_to_html(table_json: dict, claim_id: str) -> str:
+    """Render table_json ({"headers": [...], "rows": [...]}) as a deterministic HTML table."""
+    headers = table_json.get('headers', [])
+    rows = table_json.get('rows', [])
+
+    # Scale font and padding for large tables
+    row_count = len(rows)
+    if row_count > 12:
+        font_size = '0.65em'
+        cell_pad = '3px 6px'
+    elif row_count > 6:
+        font_size = '0.75em'
+        cell_pad = '4px 8px'
+    else:
+        font_size = '0.9em'
+        cell_pad = '8px 12px'
+
+    html_parts = [
+        f'<div data-claim-id="{claim_id}" contenteditable="false" class="claim-locked" '
+        f'style="overflow-x:auto;overflow-y:auto;margin:8px 0;max-height:70vh;">',
+        f'<table style="width:100%;border-collapse:collapse;font-size:{font_size};">',
+        '  <thead>',
+        '    <tr style="background:#f0f4f8;">',
+    ]
+    th_style = f'padding:{cell_pad};border-bottom:2px solid #cbd5e0;text-align:left;font-weight:600;'
+    for h in headers:
+        html_parts.append(f'      <th style="{th_style}">{h}</th>')
+    html_parts.append('    </tr>')
+    html_parts.append('  </thead>')
+    html_parts.append('  <tbody>')
+    td_style = f'padding:{cell_pad};border-bottom:1px solid #e2e8f0;text-align:left;'
+    for row in rows:
+        html_parts.append('    <tr>')
+        for cell in row:
+            html_parts.append(f'      <td style="{td_style}">{cell}</td>')
+        html_parts.append('    </tr>')
+    html_parts.append('  </tbody>')
+    html_parts.append('</table>')
+    html_parts.append('</div>')
+    return '\n'.join(html_parts)
+
+
+def _markdown_table_to_html(md: str, claim_id: str) -> str:
+    """Fallback: convert a markdown table to branded HTML when table_json is unavailable."""
+    lines = [l.strip() for l in md.strip().split('\n') if l.strip()]
+    if not lines:
+        return f'<div data-claim-id="{claim_id}" contenteditable="false" class="claim-locked">{md}</div>'
+
+    html_parts = [
+        f'<div data-claim-id="{claim_id}" contenteditable="false" class="claim-locked" style="overflow-x:auto;margin:16px 0;">',
+        '<table style="width:100%;border-collapse:collapse;font-size:0.9em;">',
+    ]
+
+    for i, line in enumerate(lines):
+        # Skip separator rows (e.g. |---|---|)
+        stripped = line.strip('|').strip()
+        if stripped and all(c in '-|: ' for c in stripped):
+            continue
+
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        tag = 'th' if i == 0 else 'td'
+        style_row = ' style="background:#f0f4f8;font-weight:600;"' if i == 0 else ''
+        style_cell = 'padding:8px 12px;border-bottom:1px solid #e2e8f0;text-align:left;'
+        if i == 0:
+            style_cell += 'font-weight:600;'
+
+        html_parts.append(f'  <tr{style_row}>')
+        for cell in cells:
+            html_parts.append(f'    <{tag} style="{style_cell}">{cell}</{tag}>')
+        html_parts.append('  </tr>')
+
+    html_parts.append('</table>')
+    html_parts.append('</div>')
+    return '\n'.join(html_parts)
 
 
 def render_spec_to_html(
@@ -951,6 +1039,9 @@ def render_spec_to_html(
             layout_patterns[sl.get('name', '').lower()] = sl
 
     # Resolve claim IDs to verbatim text inline
+    # Per-slide visual injection list: [(slide_index, html_str), ...]
+    # These are injected AFTER Claude returns — Claude never sees them.
+    _slide_visual_injections = []  # list of (slide_idx, inject_html)
     resolved = {"slides": []}
     for slide in spec.get("slides", []):
         s = {
@@ -973,19 +1064,64 @@ def render_spec_to_html(
             "text": claims_by_id[hid]["text"] if hid and hid in claims_by_id else "",
             "emphasis": h.get("emphasis"),
         }
-        s["body_claims"] = []
+        # Resolve body claims: visual claims (tables/figures) are NOT sent to Claude.
+        # They are pre-rendered as HTML and injected after Claude returns.
+        slide_idx = len(resolved["slides"])  # current slide index
+        resolved_body = []
+        has_visuals = False
         for b in slide.get("body_claims", []):
             cid = b.get("claim_id", "")
             claim_data = claims_by_id.get(cid, {}) if cid else {}
-            body_entry = {
-                "claim_id": cid,
-                "text": claim_data.get("text", ""),
-                "content_format": claim_data.get("content_format", "text"),
-                "table_markdown": claim_data.get("table_markdown"),
-                "figure_url": claim_data.get("figure_url"),
-                "role": b.get("role", "supporting"),
-            }
-            s["body_claims"].append(body_entry)
+            fmt = claim_data.get("content_format", "text")
+            role = b.get("role", "supporting")
+
+            if fmt == "table" and claim_data.get("table_json"):
+                inject_html = _table_json_to_html(claim_data["table_json"], cid)
+                _slide_visual_injections.append((slide_idx, inject_html))
+                has_visuals = True
+                print(f"[DEBUG] Table (JSON) queued for slide {slide_idx}: {cid}")
+            elif fmt == "table" and claim_data.get("table_markdown"):
+                from services.pdf_service import _parse_markdown_table
+                parsed = _parse_markdown_table(claim_data["table_markdown"])
+                if parsed:
+                    inject_html = _table_json_to_html(parsed, cid)
+                else:
+                    inject_html = _markdown_table_to_html(claim_data["table_markdown"], cid)
+                _slide_visual_injections.append((slide_idx, inject_html))
+                has_visuals = True
+                print(f"[DEBUG] Table (markdown) queued for slide {slide_idx}: {cid}")
+            elif fmt == "figure" and claim_data.get("figure_url"):
+                fig_url = claim_data["figure_url"]
+                fig_alt = claim_data.get("text", "")
+                inject_html = (
+                    f'<div data-claim-id="{cid}" contenteditable="false" class="claim-locked" '
+                    f'style="text-align:center;margin:16px 0;">'
+                    f'<img src="{fig_url}" alt="{fig_alt}" '
+                    f'style="max-width:100%;height:auto;border-radius:4px;" />'
+                    f'<p style="font-size:0.85em;color:#666;margin-top:8px;">{fig_alt}</p>'
+                    f'</div>'
+                )
+                _slide_visual_injections.append((slide_idx, inject_html))
+                has_visuals = True
+                print(f"[DEBUG] Figure queued for slide {slide_idx}: {cid}")
+            else:
+                resolved_body.append({
+                    "claim_id": cid,
+                    "text": claim_data.get("text", ""),
+                    "content_format": "text",
+                    "role": role,
+                })
+
+        # If this slide has visuals, tell Claude to leave space but send no data
+        if has_visuals and not resolved_body:
+            # Visual-only slide — give Claude a hint about the layout
+            resolved_body.append({
+                "content_format": "text",
+                "text": "(visual content will be placed here automatically)",
+                "role": "supporting",
+            })
+
+        s["body_claims"] = resolved_body
         s["footer_claims"] = [
             {
                 "claim_id": f.get("claim_id", ""),
@@ -1011,15 +1147,6 @@ def render_spec_to_html(
 
     context_parts.append(f"<slide_spec>\n{json.dumps(resolved, indent=2)}\n</slide_spec>")
 
-    # Debug: log resolved body claims with visual content
-    for si, slide in enumerate(resolved.get("slides", [])):
-        for bc in slide.get("body_claims", []):
-            if bc.get("content_format") in ("table", "figure"):
-                print(f"[DEBUG] Resolved slide {si} body claim {bc['claim_id']}: "
-                      f"content_format={bc['content_format']}, "
-                      f"figure_url={bc.get('figure_url', 'N/A')}, "
-                      f"table_markdown={'yes' if bc.get('table_markdown') else 'N/A'}")
-
     if current_html:
         context_parts.append(f"<current_html>\n{current_html}\n</current_html>")
         user_content = (
@@ -1044,7 +1171,54 @@ def render_spec_to_html(
             result_chunks.append(text)
             if on_chunk:
                 on_chunk(text)
-    return ''.join(result_chunks).strip()
+    html_result = ''.join(result_chunks).strip()
+
+    # Log slide structure for debugging injection
+    section_count = len(re.findall(r'</section>', html_result, re.IGNORECASE))
+    div_slide_count = len(re.findall(r'class="[^"]*slide[^"]*"', html_result, re.IGNORECASE))
+    print(f"[DEBUG] Claude HTML: {len(html_result)} chars, {section_count} </section> tags, {div_slide_count} slide-class divs")
+
+    # Inject pre-rendered visual content (tables/figures) into slides.
+    # Claude never saw these — we inject by finding slide boundaries in the HTML.
+    if _slide_visual_injections:
+        # Group injections by slide index
+        injections_by_slide = {}
+        for slide_idx, inject_html in _slide_visual_injections:
+            injections_by_slide.setdefault(slide_idx, []).append(inject_html)
+
+        # Find slide boundaries: try <section>, fall back to top-level slide divs
+        # Look for </section> first
+        section_ends = [m.start() for m in re.finditer(r'</section>', html_result, re.IGNORECASE)]
+        if not section_ends:
+            # Fallback: look for slide-like div closings (class containing "slide")
+            # Use a broad approach: find all top-level closing patterns
+            section_ends = [m.start() for m in re.finditer(r'</div>\s*(?=<div|$)', html_result)]
+        print(f"[DEBUG] Found {len(section_ends)} slide boundaries for {len(injections_by_slide)} slides with visuals")
+
+        # Inject in reverse order so earlier insertions don't shift later positions
+        for slide_idx in sorted(injections_by_slide.keys(), reverse=True):
+            combined_html = '\n'.join(injections_by_slide[slide_idx])
+            if slide_idx < len(section_ends):
+                pos = section_ends[slide_idx]
+                html_result = html_result[:pos] + '\n' + combined_html + '\n' + html_result[pos:]
+                print(f"[DEBUG] Injected {len(injections_by_slide[slide_idx])} visual(s) into slide {slide_idx}")
+            else:
+                # Slide index out of range — append before the LAST closing tag we found
+                # or before </body> or at the very end
+                insert_pos = None
+                for tag in ['</section>', '</main>', '</body>']:
+                    p = html_result.rfind(tag)
+                    if p > 0:
+                        insert_pos = p
+                        break
+                if insert_pos is None:
+                    # Last resort: before the final </div>
+                    insert_pos = html_result.rfind('</div>')
+                if insert_pos and insert_pos > 0:
+                    html_result = html_result[:insert_pos] + '\n' + combined_html + '\n' + html_result[insert_pos:]
+                print(f"[WARN] Slide {slide_idx} boundary not found (only {len(section_ends)} found), appended visuals at end")
+
+    return html_result
 
 
 EDIT_SPEC_TOOL = {
@@ -1453,7 +1627,9 @@ Rules:
 - Select ISI/boilerplate claims for the "footer" role when available and relevant
 - Do NOT select claims that are tangentially related — strict relevance only
 - Every selected claim must have a clear reason for being on THIS slide
-- Claims with content_format "table" or "figure" are visual assets (extracted tables/charts). When the slide topic involves data visualization, charts, or tabular data, prefer selecting these visual claims as they render as rich content on the slide."""
+- Claims with content_format "table" or "figure" are visual assets (extracted tables/charts). When the slide topic involves data visualization, charts, or tabular data, prefer selecting these visual claims as they render as rich content on the slide.
+- IMPORTANT: When you select a content_format "table" claim, do NOT also select text claims that duplicate rows from that table. The table claim already contains complete structured data. Only add 1-2 text claims for context or footnotes that are NOT in the table itself.
+- NEVER assign a "table" or "figure" claim to the "headline" role. Visual assets must always be "supporting" body claims. The headline must always be a text claim that frames the visual."""
 
 BUILD_SLIDE_SYSTEM = """You are a pharma slide builder. You receive a slide topic, a set of pre-selected claims (with assigned roles), brand guidelines, and component patterns.
 
@@ -1513,8 +1689,8 @@ EMPHASIS — set after layout is decided:
 
 CONTENT FORMAT OVERRIDES:
 When a claim has content_format other than "text", apply these layout overrides:
-- content_format: "table" → prefer data_table layout to display the table_markdown properly
-- content_format: "figure" → prefer two_column layout with the figure in one column, or full-width figure display
+- content_format: "table" → prefer data_table layout. The table claim contains complete structured data in table_markdown. Do NOT also select individual text claims that duplicate rows from the same table — the table_markdown already has all the data. You may select 1-2 text claims for context/footnotes only.
+- content_format: "figure" → prefer two_column layout with the figure in one column, or full-width figure display. Select supporting text claims for stats and context that complement the figure.
 These overrides take priority over the VWES decision tree above."""
 
 
@@ -1697,8 +1873,28 @@ def _select_claims(slide_topic, candidate_claims):
 
     for block in response.content:
         if block.type == 'tool_use' and block.name == 'select_claims':
+            selected = block.input.get('selected', [])
             print(f"[DEBUG] Claims selected for '{slide_topic}': {json.dumps(block.input, indent=2)}")
-            return block.input.get('selected', [])
+
+            # Guard: visual claims (table/figure) must never be headlines — demote to body
+            claims_lookup = {c['id']: c for c in candidate_claims}
+            headline_sel = [s for s in selected if s.get('role') == 'headline']
+            if headline_sel:
+                h = headline_sel[0]
+                h_claim = claims_lookup.get(h['claim_id'], {})
+                if h_claim.get('content_format', 'text') in ('table', 'figure'):
+                    print(f"[DEBUG] Demoting visual claim {h['claim_id']} from headline to supporting")
+                    h['role'] = 'supporting'
+                    # Promote first text body claim to headline
+                    for s in selected:
+                        if s['role'] != 'headline' and s['role'] != 'footer':
+                            s_claim = claims_lookup.get(s['claim_id'], {})
+                            if s_claim.get('content_format', 'text') == 'text':
+                                s['role'] = 'headline'
+                                print(f"[DEBUG] Promoted {s['claim_id']} to headline")
+                                break
+
+            return selected
 
     raise ValueError(f"Claim selector did not return selections for topic: {slide_topic}")
 
@@ -1714,19 +1910,26 @@ def _build_slide(slide_topic, selected_claims, all_claims, brand_guidelines, com
         cid = sel['claim_id']
         claim = claims_by_id.get(cid)
         if claim:
-            entry = {
-                "claim_id": cid,
-                "role": sel['role'],
-                "text": claim['text'],
-                "type": claim.get('claim_type', ''),
-                "tags": claim.get('tags') or [],
-                "numeric_values": claim.get('numeric_values') or [],
-                "content_format": claim.get('content_format', 'text'),
-            }
-            if claim.get('table_markdown'):
-                entry["table_markdown"] = claim['table_markdown']
-            if claim.get('figure_url'):
-                entry["figure_url"] = claim['figure_url']
+            fmt = claim.get('content_format', 'text')
+            if fmt in ('table', 'figure'):
+                # Visual claims: send only label + format, no raw data
+                caption = claim['text'][:120] if claim.get('text') else fmt
+                entry = {
+                    "claim_id": cid,
+                    "role": sel['role'],
+                    "text": f"[Visual: {caption}]",
+                    "content_format": fmt,
+                }
+            else:
+                entry = {
+                    "claim_id": cid,
+                    "role": sel['role'],
+                    "text": claim['text'],
+                    "type": claim.get('claim_type', ''),
+                    "tags": claim.get('tags') or [],
+                    "numeric_values": claim.get('numeric_values') or [],
+                    "content_format": fmt,
+                }
             selected_full.append(entry)
 
     # Guard: if no valid claims resolved, return a title_only slide with no claim refs

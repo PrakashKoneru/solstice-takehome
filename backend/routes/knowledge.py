@@ -95,6 +95,8 @@ def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=No
                             claim_type='stat',
                             content_format='table',
                             table_markdown=tbl['markdown'],
+                            table_json=tbl.get('table_json'),
+                            figure_url=tbl.get('figure_url'),
                             page_number=tbl['page_number'],
                             section=tbl.get('section'),
                             tags=['table'],

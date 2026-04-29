@@ -138,6 +138,46 @@ def _detect_claim_drift(html: str, claims_by_id: dict) -> list:
     return flags
 
 
+_VISUAL_TOKEN_RE = re.compile(r'\{\{\s*(?:VISUAL|visual)[_\-\s]*\d+\s*\}\}', re.IGNORECASE)
+
+
+def _verify_visual_injections(html: str, spec: dict, claims_by_id: dict) -> list:
+    """Verify all visual claims were properly injected into the final HTML."""
+    issues = []
+
+    # Check for unreplaced {{VISUAL_N}} tokens
+    leftover = _VISUAL_TOKEN_RE.findall(html)
+    for token in leftover:
+        issues.append({
+            'type': 'unreplaced_token',
+            'detail': f'Visual placeholder {token} was not replaced in final HTML.',
+        })
+
+    # Check each visual claim in the spec has its data-claim-id in the HTML
+    for slide in spec.get('slides', []):
+        for bc in slide.get('body_claims', []):
+            fmt = bc.get('content_format', 'text')
+            cid = bc.get('claim_id', '')
+            if fmt != 'visual_placeholder' and cid:
+                claim = claims_by_id.get(cid, {})
+                if claim.get('content_format') in ('table', 'figure'):
+                    # This was a visual claim — verify it landed in the HTML
+                    if f'data-claim-id="{cid}"' not in html:
+                        issues.append({
+                            'type': 'missing_visual',
+                            'claim_id': cid,
+                            'detail': f'Visual claim {cid} not found in final HTML.',
+                        })
+                    elif claim.get('figure_url') and claim['figure_url'] not in html:
+                        issues.append({
+                            'type': 'wrong_src',
+                            'claim_id': cid,
+                            'detail': f'Visual claim {cid} present but figure_url not in img src.',
+                        })
+
+    return issues
+
+
 @chat_bp.route('/api/sessions/<int:session_id>/review', methods=['POST'])
 def rerun_review(session_id):
     """Recompute the compliance review for the current HTML without touching
@@ -371,6 +411,11 @@ def send_message(session_id):
             )
         review_report = build_compliance_trace(spec, claims_by_id)
         review_report['spec'] = spec
+        # Verify visual injections
+        visual_issues = _verify_visual_injections(html_content, spec, claims_by_id)
+        if visual_issues:
+            review_report.setdefault('visual_issues', []).extend(visual_issues)
+            print(f"[WARN] Visual injection issues: {visual_issues}")
         if kb_texts:
             try:
                 soft = review_content(html_content, kb_texts)
@@ -731,6 +776,10 @@ def send_message_stream(session_id):
                     # Compliance (non-blocking — user already has HTML)
                     review_report = build_compliance_trace(spec, claims_by_id)
                     review_report['spec'] = spec
+                    visual_issues = _verify_visual_injections(html_content, spec, claims_by_id)
+                    if visual_issues:
+                        review_report.setdefault('visual_issues', []).extend(visual_issues)
+                        print(f"[WARN] Visual injection issues: {visual_issues}")
                     if kb_texts:
                         try:
                             soft = review_content(html_content, kb_texts)

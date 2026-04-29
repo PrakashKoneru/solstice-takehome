@@ -1,7 +1,43 @@
 import base64
 import os
+import re as _re
 import cloudinary
 import cloudinary.uploader
+
+
+def _parse_markdown_table(md: str) -> dict:
+    """Parse a markdown table into structured JSON.
+
+    Returns {"headers": ["col1", ...], "rows": [["val1", ...], ...]}.
+    Returns None if parsing fails.
+    """
+    lines = [l.strip() for l in md.strip().split('\n') if l.strip()]
+    if len(lines) < 2:
+        return None
+
+    def _split_row(line):
+        # Strip leading/trailing pipes, split on pipe
+        return [c.strip() for c in line.strip('|').split('|')]
+
+    headers = _split_row(lines[0])
+    rows = []
+    for line in lines[1:]:
+        stripped = line.strip('|').strip()
+        # Skip separator rows (e.g. |---|---|)
+        if stripped and all(c in '-|: ' for c in stripped):
+            continue
+        cells = _split_row(line)
+        # Pad or truncate to match header count
+        if len(cells) < len(headers):
+            cells.extend([''] * (len(headers) - len(cells)))
+        elif len(cells) > len(headers):
+            cells = cells[:len(headers)]
+        rows.append(cells)
+
+    if not headers:
+        return None
+
+    return {"headers": headers, "rows": rows}
 
 
 def extract_document_outline(filepath: str) -> list:
@@ -578,12 +614,18 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
                     last_line = page_content[-1].strip()
                     if last_line.lower().startswith("table") or len(last_line) < 120:
                         caption = last_line
+                table_json = _parse_markdown_table(md)
                 tables.append({
                     "page_number": page_no,
                     "markdown": md,
+                    "table_json": table_json,
                     "caption": caption,
                     "section": current_section,
                 })
+                if table_json:
+                    print(f"[DOCLING-KB] Table {tbl_idx} parsed to JSON: {len(table_json['headers'])} cols, {len(table_json['rows'])} rows")
+                else:
+                    print(f"[DOCLING-KB] Table {tbl_idx} JSON parse failed, will use markdown fallback")
                 # Embed table in page text too
                 page_texts[page_no].append(md)
                 print(f"[DOCLING-KB] Table {tbl_idx} from page {page_no}: {len(md)} chars")
