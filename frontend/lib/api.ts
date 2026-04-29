@@ -101,7 +101,8 @@ export type DesignSystemAsset = {
   asset_type: 'icon' | 'logo' | 'image'
   file_url: string
   filename: string
-  source: 'raster' | 'page_render'
+  source: string
+  page_number: number | null
   created_at: string
 }
 

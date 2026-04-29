@@ -116,7 +116,8 @@ class DesignSystemAsset(db.Model):
     asset_type       = db.Column(db.String(50), nullable=False)   # icon | logo | image
     file_url         = db.Column(db.String(500), nullable=False)
     filename         = db.Column(db.String(255), nullable=False)
-    source           = db.Column(db.String(50), nullable=False, default='raster')  # raster | page_render
+    source           = db.Column(db.String(50), nullable=False, default='raster')  # claude_crop | raster
+    page_number      = db.Column(db.Integer, nullable=True)
     created_at       = db.Column(db.DateTime, default=datetime.utcnow)
 
     def to_dict(self):
@@ -128,6 +129,7 @@ class DesignSystemAsset(db.Model):
             'file_url':         self.file_url,
             'filename':         self.filename,
             'source':           self.source,
+            'page_number':      self.page_number,
             'created_at':       self.created_at.isoformat(),
         }
 
