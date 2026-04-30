@@ -154,6 +154,8 @@ class Claim(db.Model):
     # [{"value": "7.4", "unit": "months", "label": "median OS (FRUZAQLA)"}]
     tags            = db.Column(db.JSON, nullable=True)
     section         = db.Column(db.String(255), nullable=True)
+    section_hierarchy = db.Column(db.JSON, nullable=True)  # ["5. WARNINGS", "5.5. Hepatotoxicity"]
+    embedding       = db.Column(db.JSON, nullable=True)   # list of floats from OpenAI embedding
     is_approved     = db.Column(db.Boolean, default=True, nullable=False)
     created_at      = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -172,6 +174,7 @@ class Claim(db.Model):
             'numeric_values':  self.numeric_values or [],
             'tags':            self.tags or [],
             'section':         self.section,
+            'section_hierarchy': self.section_hierarchy or [],
             'is_approved':     self.is_approved,
             'created_at':      self.created_at.isoformat(),
         }

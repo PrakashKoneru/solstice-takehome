@@ -77,9 +77,13 @@ You help the user plan, refine, and discuss their slide deck. You MUST NEVER out
 CONTEXT AWARENESS:
 You have full visibility into this session's conversation history. The history shows "[slides generated]" wherever a slide was produced — that means slides exist in the output panel. When a user references "the current slide" or "slide 2", acknowledge what has been built. Never tell the user you cannot see their slides or documents.
 
-DOCUMENT NAVIGATION:
-When <document_outline> is provided, you know the KB document's section structure.
-Use it to help the user explore what content is available. When they ask about a section, reference it by name. Suggest specific sections that would make good slides.
+DOCUMENT NAVIGATION — strict sourcing rule:
+When <document_outline> is provided, it is the ONLY source of truth for what content the document contains.
+- When describing available content, list the EXACT heading titles from the outline. Do NOT rename, regroup, paraphrase, or summarize headings into your own categories.
+- When the user asks "what can I build" or "what content is available", respond with the actual section headings organized by their hierarchy in the outline — not by your own interpretation of the document.
+- Do NOT invent section names like "Clinical Efficacy" or "Safety Profile" unless those exact words appear as headings in the outline.
+- When suggesting slides, reference the exact heading the slide would draw from.
+- If <document_outline> is not provided, say "No document structure is available — please re-upload the document."
 
 ASSET AWARENESS:
 When <brand_assets> is provided, reference available logos, icons, and graphics by name when discussing layouts or design options.
@@ -908,9 +912,9 @@ HARD RULES:
 
 VISUAL CONTENT:
 Tables and figures are injected automatically AFTER you return your HTML. You will NOT see them in the spec.
-- If a body_claim says "(visual content will be placed here automatically)", leave generous empty space in that area — a full-width container with min-height. The visual will be inserted there.
-- Do NOT create placeholder text, fake tables, or dummy images. Just leave the space open.
-- IMPORTANT: slide content areas MUST NOT have overflow:hidden or fixed heights that would clip injected content. Use min-height and let content expand naturally.
+- If a body_claim says "(visual content will be placed here automatically)", render an empty div with class="visual-inject-target" and style="width:100%;" at that position. Do NOT add min-height, padding, or any other sizing — the visual will fill it.
+- Do NOT create placeholder text, fake tables, or dummy images. Just place the empty target div.
+- IMPORTANT: slide content areas MUST NOT have overflow:hidden or fixed heights that would clip injected content. Let content expand naturally.
 
 TEXT CLAIMS:
 Body claims with content_format "text" are rendered normally:
@@ -1186,37 +1190,46 @@ def render_spec_to_html(
         for slide_idx, inject_html in _slide_visual_injections:
             injections_by_slide.setdefault(slide_idx, []).append(inject_html)
 
-        # Find slide boundaries: try <section>, fall back to top-level slide divs
-        # Look for </section> first
-        section_ends = [m.start() for m in re.finditer(r'</section>', html_result, re.IGNORECASE)]
-        if not section_ends:
-            # Fallback: look for slide-like div closings (class containing "slide")
-            # Use a broad approach: find all top-level closing patterns
-            section_ends = [m.start() for m in re.finditer(r'</div>\s*(?=<div|$)', html_result)]
-        print(f"[DEBUG] Found {len(section_ends)} slide boundaries for {len(injections_by_slide)} slides with visuals")
+        # Strategy 1: Replace visual-inject-target divs (preferred — precise placement)
+        target_pattern = re.compile(r'<div[^>]*class="visual-inject-target"[^>]*>\s*</div>', re.IGNORECASE)
+        targets = list(target_pattern.finditer(html_result))
+        if targets:
+            print(f"[DEBUG] Found {len(targets)} visual-inject-target divs")
+            # Match targets to slide indices: nth target → nth slide with visuals
+            visual_slide_indices = sorted(injections_by_slide.keys())
+            for i in range(min(len(targets), len(visual_slide_indices)) - 1, -1, -1):
+                slide_idx = visual_slide_indices[i]
+                combined_html = '\n'.join(injections_by_slide[slide_idx])
+                match = targets[i]
+                html_result = html_result[:match.start()] + combined_html + html_result[match.end():]
+                print(f"[DEBUG] Replaced visual-inject-target {i} with {len(injections_by_slide[slide_idx])} visual(s) for slide {slide_idx}")
+                del injections_by_slide[slide_idx]
 
-        # Inject in reverse order so earlier insertions don't shift later positions
-        for slide_idx in sorted(injections_by_slide.keys(), reverse=True):
-            combined_html = '\n'.join(injections_by_slide[slide_idx])
-            if slide_idx < len(section_ends):
-                pos = section_ends[slide_idx]
-                html_result = html_result[:pos] + '\n' + combined_html + '\n' + html_result[pos:]
-                print(f"[DEBUG] Injected {len(injections_by_slide[slide_idx])} visual(s) into slide {slide_idx}")
-            else:
-                # Slide index out of range — append before the LAST closing tag we found
-                # or before </body> or at the very end
-                insert_pos = None
-                for tag in ['</section>', '</main>', '</body>']:
-                    p = html_result.rfind(tag)
-                    if p > 0:
-                        insert_pos = p
-                        break
-                if insert_pos is None:
-                    # Last resort: before the final </div>
-                    insert_pos = html_result.rfind('</div>')
-                if insert_pos and insert_pos > 0:
-                    html_result = html_result[:insert_pos] + '\n' + combined_html + '\n' + html_result[insert_pos:]
-                print(f"[WARN] Slide {slide_idx} boundary not found (only {len(section_ends)} found), appended visuals at end")
+        # Strategy 2: Fall back to section boundaries for any remaining injections
+        if injections_by_slide:
+            section_ends = [m.start() for m in re.finditer(r'</section>', html_result, re.IGNORECASE)]
+            if not section_ends:
+                section_ends = [m.start() for m in re.finditer(r'</div>\s*(?=<div|$)', html_result)]
+            print(f"[DEBUG] Found {len(section_ends)} slide boundaries for {len(injections_by_slide)} remaining slides with visuals")
+
+            for slide_idx in sorted(injections_by_slide.keys(), reverse=True):
+                combined_html = '\n'.join(injections_by_slide[slide_idx])
+                if slide_idx < len(section_ends):
+                    pos = section_ends[slide_idx]
+                    html_result = html_result[:pos] + '\n' + combined_html + '\n' + html_result[pos:]
+                    print(f"[DEBUG] Injected {len(injections_by_slide[slide_idx])} visual(s) into slide {slide_idx}")
+                else:
+                    insert_pos = None
+                    for tag in ['</section>', '</main>', '</body>']:
+                        p = html_result.rfind(tag)
+                        if p > 0:
+                            insert_pos = p
+                            break
+                    if insert_pos is None:
+                        insert_pos = html_result.rfind('</div>')
+                    if insert_pos and insert_pos > 0:
+                        html_result = html_result[:insert_pos] + '\n' + combined_html + '\n' + html_result[insert_pos:]
+                    print(f"[WARN] Slide {slide_idx} boundary not found (only {len(section_ends)} found), appended visuals at end")
 
     return html_result
 
@@ -1324,7 +1337,14 @@ Rules:
 - Match the user's intent to the closest available claim in the catalog.
 - For replace actions, set new_claim_id to the best matching claim from the catalog.
 - When adding slides, choose a layout that fits the claims and respects brand guidelines if provided.
-- Claim IDs in new_slide must come from the claim catalog."""
+- Claim IDs in new_slide must come from the claim catalog.
+
+Table/Visual claim handling:
+- Claims with content_format "table" or "figure" are visual assets extracted from the document. They render as rich tables or figures on the slide.
+- When the user asks for a specific table (e.g. "Table 2", "the adverse reactions table"), find the claim with content_format "table" whose text/id matches. Use that claim's exact ID.
+- When a slide features a table claim, use layout "data_table". The headline should be a TEXT claim that frames the table (e.g. a section header or context sentence). The table claim goes in body_claims with role "supporting".
+- NEVER put a table/figure claim as the headline. Headlines must be text claims.
+- Use section_hierarchy to disambiguate claims from different sections (e.g. "FRESCO-2 Study" under "6. ADVERSE REACTIONS" vs under "14. CLINICAL STUDIES")."""
 
 
 def edit_slide_spec(
@@ -1338,13 +1358,23 @@ def edit_slide_spec(
     Apply targeted edits to an existing spec. Returns the modified spec.
     Uses a lightweight tool call to determine edits, then applies them in Python.
     """
+    print(f"[PIPELINE] edit_slide_spec: prompt=\"{prompt[:120]}\"")
+    print(f"[PIPELINE] edit_slide_spec: {len(claims)} claims, {len(current_spec.get('slides', []))} existing slides")
     client = _get_client()
 
     claims_by_id = {c['id']: c for c in claims}
-    catalog = [
-        {"id": c['id'], "text": c['text'], "type": c['claim_type'], "tags": c.get('tags') or []}
-        for c in claims
-    ]
+    catalog = []
+    for c in claims:
+        entry = {
+            "id": c['id'],
+            "text": c['text'],
+            "type": c['claim_type'],
+            "tags": c.get('tags') or [],
+            "content_format": c.get('content_format', 'text'),
+        }
+        if c.get('section_hierarchy'):
+            entry["section_hierarchy"] = c['section_hierarchy']
+        catalog.append(entry)
 
     # Resolve current spec so the model sees actual text, not just IDs
     resolved_spec = copy.deepcopy(current_spec)
@@ -1362,6 +1392,105 @@ def edit_slide_spec(
             if cid and cid in claims_by_id:
                 fc['text'] = claims_by_id[cid]['text']
 
+    # Prefilter catalog: use section_hierarchy to find claims from the right part of the document
+    deck_claim_ids = set()
+    for slide in current_spec.get('slides', []):
+        h = slide.get('headline', {})
+        if h.get('claim_id'):
+            deck_claim_ids.add(h['claim_id'])
+        for bc in slide.get('body_claims', []):
+            if bc.get('claim_id'):
+                deck_claim_ids.add(bc['claim_id'])
+        for fc in slide.get('footer_claims', []):
+            if fc.get('claim_id'):
+                deck_claim_ids.add(fc['claim_id'])
+
+    prompt_lower = prompt.lower()
+    prompt_words = set(re.sub(r'[^a-z0-9\s]', '', prompt_lower).split())
+    prompt_words -= {'the', 'a', 'an', 'and', 'or', 'for', 'to', 'on', 'in', 'of', 'can', 'you',
+                     'create', 'make', 'add', 'show', 'display', 'slide', 'please', 'with'}
+
+    filtered_catalog = []
+    extra_scored = []
+    for c in catalog:
+        cid = c['id']
+        # Always keep: claims already in the deck
+        if cid in deck_claim_ids:
+            filtered_catalog.append(c)
+            continue
+
+        score = 0
+
+        # Section hierarchy matching: check if prompt phrases match any ancestor
+        # e.g. prompt "dosage modifications" matches "2.2. Dosage Modifications for Adverse Reactions"
+        for section_entry in (c.get('section_hierarchy') or []):
+            section_lower = section_entry.lower()
+            # Substring match: "dosage modifications" in "2.2. dosage modifications for adverse reactions"
+            # Check 2+ word phrases from prompt against section titles
+            if any(pw in section_lower for pw in prompt_words if len(pw) > 3):
+                score += 5
+            # Bonus: check multi-word phrase match (stronger signal)
+            # Extract meaningful phrases from prompt (consecutive content words)
+            section_words = set(re.sub(r'[^a-z0-9\s]', '', section_lower).split())
+            section_overlap = len(prompt_words & section_words)
+            if section_overlap >= 2:
+                score += 10  # strong section match
+
+        # Tag and text keyword matching
+        claim_words = set(re.sub(r'[^a-z0-9\s]', '', (c.get('text') or '').lower()).split())
+        tag_words = set(t.lower() for t in (c.get('tags') or []))
+        score += len(prompt_words & tag_words) * 3
+        score += len(prompt_words & claim_words)
+
+        # Explicit table/figure number match: "table 2" in prompt vs claim text
+        for ref in re.findall(r'(?:table|figure)\s*\d+', prompt_lower):
+            if ref in (c.get('text') or '').lower():
+                score += 20
+
+        # Always keep visual claims with any relevance signal
+        if c.get('content_format') in ('table', 'figure') and score > 0:
+            score += 10  # boost relevant visuals
+
+        if score > 0:
+            extra_scored.append((c, score))
+
+    # Take top 40 prompt-relevant claims, sorted by score
+    extra_scored.sort(key=lambda x: x[1], reverse=True)
+    for c, s in extra_scored[:40]:
+        filtered_catalog.append(c)
+        if s >= 10:
+            fmt = c.get('content_format', 'text')
+            label = f" [{fmt}]" if fmt != 'text' else ''
+            print(f"[DEBUG] Edit prefilter (score={s}): {c['id']}{label} — {c.get('text', '')[:80]}")
+
+    print(f"[DEBUG] Edit catalog: {len(filtered_catalog)}/{len(catalog)} claims (deck={len(deck_claim_ids)})")
+    catalog = filtered_catalog
+
+    # Detect explicit visual references (e.g. "Table 2", "Figure 3") and pin them
+    pinned_visuals = _match_explicit_visuals(prompt, claims)
+    pinned_directive = ""
+    if pinned_visuals:
+        # Ensure pinned claims are in the catalog
+        catalog_ids = {c['id'] for c in catalog}
+        for pv in pinned_visuals:
+            if pv['id'] not in catalog_ids:
+                catalog.append({
+                    "id": pv['id'], "text": pv['text'],
+                    "type": pv.get('claim_type', ''), "tags": pv.get('tags') or [],
+                    "content_format": pv.get('content_format', 'text'),
+                    "section_hierarchy": pv.get('section_hierarchy') or [],
+                })
+        pinned_ids = [pv['id'] for pv in pinned_visuals]
+        pinned_directive = (
+            f"\n\n<pinned_claims>\n"
+            f"The user is specifically requesting these visual assets. You MUST use them:\n"
+            + "\n".join(f"- {pv['id']} ({pv.get('content_format','text')}): {pv['text'][:120]}" for pv in pinned_visuals)
+            + f"\nUse layout \"data_table\" for table claims. Put the table claim in body_claims as \"supporting\". "
+            f"Use a text claim from the same section as the headline.\n"
+            f"</pinned_claims>"
+        )
+        print(f"[DEBUG] Edit: pinned visuals: {pinned_ids}")
+
     claim_id_enum = [c['id'] for c in catalog]
     tool = copy.deepcopy(EDIT_SPEC_TOOL)
     # Inject enum into new_claim_id
@@ -1375,6 +1504,7 @@ def edit_slide_spec(
         f"<current_spec>\n{json.dumps(resolved_spec, indent=2)}\n</current_spec>\n\n"
         f"<claim_catalog>\n{json.dumps(catalog, indent=2)}\n</claim_catalog>\n\n"
         f"{brand_block}"
+        f"{pinned_directive}"
         f"{prompt}"
     )
 
@@ -1466,6 +1596,7 @@ def edit_slide_spec(
         slides.insert(insert_pos, new_slide)
 
     print(f"[DEBUG] spec after edits applied: {json.dumps(spec, indent=2)}")
+    print(f"[PIPELINE] edit_slide_spec: result → {len(slides)} slides, edits={len(per_slide_edits)} per-slide, {len(adds)} adds, {len(removes)} removes")
     return spec
 
 
@@ -1473,7 +1604,7 @@ def edit_slide_spec(
 
 NARRATIVE_PLAN_TOOL = {
     "name": "plan_narrative",
-    "description": "Plan the narrative arc of the slide deck by listing slide topics.",
+    "description": "Plan the narrative arc of the slide deck by listing slide topics grounded in document headings.",
     "input_schema": {
         "type": "object",
         "properties": {
@@ -1484,24 +1615,24 @@ NARRATIVE_PLAN_TOOL = {
                     "properties": {
                         "topic": {
                             "type": "string",
-                            "description": "Short description of the slide's intent"
+                            "description": "Short description of the slide's intent, derived from the document heading"
                         },
-                        "claim_types": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "Which claim types are relevant (efficacy, safety, dosing, isi, etc.)"
+                        "section": {
+                            "type": "string",
+                            "description": "The EXACT heading title from <document_outline> that this slide maps to"
                         },
                         "keywords": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Key terms for claim filtering (e.g. 'OS', 'PFS', 'adverse events')"
+                            "description": "Key terms from the heading text for claim filtering"
                         },
-                        "section": {
-                            "type": "string",
-                            "description": "The document section this slide draws from (from the document outline, if available)"
+                        "claim_types": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional: claim types if known (efficacy, safety, dosing, isi, etc.)"
                         }
                     },
-                    "required": ["topic", "claim_types", "keywords"]
+                    "required": ["topic", "section", "keywords"]
                 }
             }
         },
@@ -1605,19 +1736,23 @@ BUILD_SLIDE_TOOL = {
     }
 }
 
-NARRATIVE_PLAN_SYSTEM = """You are a pharma slide deck narrative planner. Given the user's request, available claim types/tags, audience, and brand tone — produce an ordered list of slide topics that form a coherent narrative arc.
+NARRATIVE_PLAN_SYSTEM = """You are a pharma slide deck narrative planner. You plan slides strictly from the document's own structure.
 
-Each topic is a short description of the slide's intent (e.g. "Overall survival primary endpoint", "Safety profile overview"). For each topic, specify which claim types are relevant and key terms for filtering claims.
+HARD RULE: Every slide you plan MUST map to a real section heading from <document_outline>. You must set the "section" field to the EXACT heading title from the outline. Do NOT invent topics that are not in the outline. Do NOT use generic categories like "efficacy overview" or "safety profile" unless those exact words appear as a heading in the outline.
 
-When <document_outline> is provided, use it to understand the source document's structure. When the user references a section by name, map it directly to the matching outline entry and set the "section" field on the corresponding slide plan. This ensures claims from the correct document section are prioritized.
+Your job:
+1. Read <document_outline> to understand what sections the document contains.
+2. Read the user's prompt to understand which parts of the document they want slides for.
+3. Map the user's request to specific outline headings. Each slide plan corresponds to one or more outline sections.
+4. Set the "topic" field to a short description derived from the heading, and the "section" field to the exact heading title.
+5. Set "keywords" to key terms from the heading text itself — not from outside knowledge.
 
 Guidelines:
 - Start with a hero/title slide if the request implies a full deck
-- Group related data logically (efficacy → safety → dosing)
 - Keep the deck focused — 4-8 slides for a typical request
-- Include ISI/safety information where clinically appropriate
-- When the document outline is available, use its section names in the "section" field to ground each slide in a specific part of the document
-- When <visual_assets> is provided, these are tables and figures extracted from the document. Incorporate them into the narrative when relevant — e.g. if the user asks for a slide with a chart or table, plan a slide topic that targets that visual asset. Use keywords from the visual asset's text/caption in the slide plan's keywords field."""
+- When the user says something broad like "efficacy", find all outline headings that fall under efficacy-related sections and plan slides from those specific headings
+- When <visual_assets> is provided, these are tables and figures extracted from the document. Incorporate them into the narrative when relevant. Use keywords from the visual asset's text/caption in the slide plan's keywords field.
+- If <document_outline> is missing or empty, tell the user via a single-slide plan with topic "No document structure available — please re-upload the document"."""
 
 SELECT_CLAIMS_SYSTEM = """You are a strict claim selector for pharma slides. Given a slide topic and candidate claims, select ONLY the claims that are directly relevant to this specific slide topic. Err on the side of fewer, more relevant claims.
 
@@ -1628,8 +1763,10 @@ Rules:
 - Do NOT select claims that are tangentially related — strict relevance only
 - Every selected claim must have a clear reason for being on THIS slide
 - Claims with content_format "table" or "figure" are visual assets (extracted tables/charts). When the slide topic involves data visualization, charts, or tabular data, prefer selecting these visual claims as they render as rich content on the slide.
-- IMPORTANT: When you select a content_format "table" claim, do NOT also select text claims that duplicate rows from that table. The table claim already contains complete structured data. Only add 1-2 text claims for context or footnotes that are NOT in the table itself.
-- NEVER assign a "table" or "figure" claim to the "headline" role. Visual assets must always be "supporting" body claims. The headline must always be a text claim that frames the visual."""
+- CRITICAL: Select at most ONE table claim per slide. Pick the table whose caption most closely matches the slide topic. Do NOT select multiple tables.
+- When you select a content_format "table" claim, do NOT also select text claims that duplicate rows from that table. The table claim already contains complete structured data. Only add 1-2 text claims for context or footnotes that are NOT in the table itself.
+- NEVER assign a "table" or "figure" claim to the "headline" role. Visual assets must always be "supporting" body claims. The headline must always be a text claim that frames the visual.
+- Pay close attention to what the table caption says. "adverse reactions" and "laboratory abnormalities" are DIFFERENT tables. Match the table whose caption aligns with the slide topic."""
 
 BUILD_SLIDE_SYSTEM = """You are a pharma slide builder. You receive a slide topic, a set of pre-selected claims (with assigned roles), brand guidelines, and component patterns.
 
@@ -1698,15 +1835,9 @@ def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_
     """Step 0: Plan the narrative arc — produces ordered slide topics."""
     client = _get_client()
 
-    # Build compact claim summary grouped by section (if available), then by type
-    claim_summary = {}
-    section_summary = {}
-    visual_assets = []  # tables and figures available for slides
+    # Build visual assets list (tables/figures) — the planner needs to know what visuals exist
+    visual_assets = []
     for c in claims:
-        ctype = c.get('claim_type', 'unknown')
-        tags = c.get('tags') or []
-        claim_summary.setdefault(ctype, set()).update(t.lower() for t in tags)
-        # Track visual assets (tables/figures)
         content_format = c.get('content_format', 'text')
         if content_format in ('table', 'figure'):
             visual_assets.append({
@@ -1716,24 +1847,12 @@ def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_
                 'section': c.get('section'),
                 'page_number': c.get('page_number'),
             })
-        # Group by section if available
-        section = c.get('section')
-        if section:
-            sec_data = section_summary.setdefault(section, {})
-            sec_data.setdefault('claim_types', set()).add(ctype)
-            sec_data.setdefault('tags', set()).update(t.lower() for t in tags)
-    # Convert sets to lists for JSON serialization
-    claim_summary = {k: sorted(v) for k, v in claim_summary.items()}
-    for sec in section_summary.values():
-        sec['claim_types'] = sorted(sec['claim_types'])
-        sec['tags'] = sorted(sec['tags'])
 
     context_parts = []
     if doc_outline:
         context_parts.append(f"<document_outline>\n{json.dumps(doc_outline, indent=2)}\n</document_outline>")
-    if section_summary:
-        context_parts.append(f"<claims_by_section>\n{json.dumps(section_summary, indent=2)}\n</claims_by_section>")
-    context_parts.append(f"<available_claim_types>\n{json.dumps(claim_summary, indent=2)}\n</available_claim_types>")
+    else:
+        context_parts.append("<document_outline>No document outline available.</document_outline>")
     if visual_assets:
         context_parts.append(f"<visual_assets>\n{json.dumps(visual_assets, indent=2)}\n</visual_assets>")
     if brand_guidelines:
@@ -1808,17 +1927,41 @@ def _prefilter_claims(claims, slide_plan):
         text_overlap = len(keywords & text_tokens)
         score = tag_overlap * 3 + text_overlap  # tags weighted higher
 
-        # Heavily boost claims from matching document section
-        claim_section = (c.get('section') or '').lower().strip()
-        if target_section and claim_section and target_section in claim_section:
+        # Heavily boost claims from matching document section (check full hierarchy)
+        claim_sections = [s.lower() for s in (c.get('section_hierarchy') or [])]
+        if not claim_sections:
+            # Fallback to flat section for backward compat
+            flat = (c.get('section') or '').lower().strip()
+            if flat:
+                claim_sections = [flat]
+        if target_section and any(target_section in s for s in claim_sections):
             score += 10
+
+        # Match topic words against claim text (critical for tables with enriched captions)
+        topic_words = set(re.sub(r'[^a-z0-9\s]', '', (slide_plan.get('topic') or '').lower()).split())
+        topic_words -= {'the', 'and', 'for', 'from', 'with', 'that', 'this', 'show', 'add', 'table', 'slide', 'create'}
+        claim_text_words = set(re.sub(r'[^a-z0-9\s]', '', (c.get('text') or '').lower()).split())
+        topic_text_match = len(topic_words & claim_text_words)
+        if is_visual and topic_text_match >= 2:
+            score += 15  # strong match between topic and table caption/context
 
         # Boost visual claims — any keyword match in their caption is highly relevant
         if is_visual and (text_overlap > 0 or tag_overlap > 0):
             score += 8
         # Visual claims in matching section always included even with zero keyword overlap
-        elif is_visual and target_section and claim_section and target_section in claim_section:
+        elif is_visual and target_section and any(target_section in s for s in claim_sections):
             score += 5
+
+        # Boost if the slide topic explicitly mentions this table/figure by number
+        # e.g., topic "Overall Survival (Table 7, Figure 2)" → match "Table 7" in caption
+        if is_visual:
+            claim_text_lower = (c.get('text') or '').lower()
+            topic_lower = (slide_plan.get('topic') or '').lower()
+            # Match "table N" or "figure N" in both topic and caption
+            for ref in re.findall(r'(?:table|figure)\s*\d+', topic_lower):
+                if ref in claim_text_lower:
+                    score += 20  # strong signal — user/planner explicitly named this visual
+                    break
 
         if score > 0 or not keywords:
             content_scored.append((c, score))
@@ -1848,6 +1991,7 @@ def _select_claims(slide_topic, candidate_claims):
             "type": c.get('claim_type', ''),
             "tags": c.get('tags') or [],
             "content_format": c.get('content_format', 'text'),
+            "section_hierarchy": c.get('section_hierarchy') or [],
         }
         for c in candidate_claims
     ]
@@ -1893,6 +2037,33 @@ def _select_claims(slide_topic, candidate_claims):
                                 s['role'] = 'headline'
                                 print(f"[DEBUG] Promoted {s['claim_id']} to headline")
                                 break
+
+            # Guard: max ONE table per slide. If multiple tables selected, keep the
+            # most relevant one (best caption match to slide_topic) and drop the rest.
+            table_selections = [
+                s for s in selected
+                if claims_lookup.get(s['claim_id'], {}).get('content_format') == 'table'
+            ]
+            if len(table_selections) > 1:
+                topic_lower = slide_topic.lower()
+                topic_words = set(re.sub(r'[^a-z0-9\s]', '', topic_lower).split())
+
+                def _table_relevance(sel):
+                    claim = claims_lookup.get(sel['claim_id'], {})
+                    caption = (claim.get('text') or '').lower()
+                    caption_words = set(re.sub(r'[^a-z0-9\s]', '', caption).split())
+                    score = len(topic_words & caption_words) * 2
+                    # Bonus for table number match
+                    for ref in re.findall(r'table\s*\d+', topic_lower):
+                        if ref in caption:
+                            score += 20
+                    return score
+
+                table_selections.sort(key=_table_relevance, reverse=True)
+                keep = table_selections[0]
+                drop_ids = {s['claim_id'] for s in table_selections[1:]}
+                selected = [s for s in selected if s['claim_id'] not in drop_ids]
+                print(f"[DEBUG] Kept table {keep['claim_id']}, dropped {drop_ids}")
 
             return selected
 
@@ -1994,6 +2165,84 @@ def _build_slide(slide_topic, selected_claims, all_claims, brand_guidelines, com
     raise ValueError(f"Slide builder did not return a slide for topic: {slide_topic}")
 
 
+def _match_explicit_visuals(prompt: str, claims: list) -> list:
+    """Detect explicit table/figure references in the user prompt and return matching claims.
+
+    Handles patterns like:
+    - "display table 7", "show table 5", "table 6"
+    - "show figure 2", "display the Kaplan-Meier figure"
+    - "show the survival table", "display the adverse reactions table"
+    """
+    prompt_lower = prompt.lower()
+    matched = []
+
+    # Build visual claim lookup
+    visual_claims = [c for c in claims if c.get('content_format') in ('table', 'figure')]
+    print(f"[PIPELINE] _match_explicit_visuals: {len(visual_claims)} visual claims in catalog")
+    if not visual_claims:
+        print(f"[PIPELINE] _match_explicit_visuals: no visual claims → skip")
+        return []
+
+    # 1. Match by explicit number: "table 5", "figure 2"
+    table_nums = re.findall(r'\btable\s*(\d+)\b', prompt_lower)
+    figure_nums = re.findall(r'\bfigure\s*(\d+)\b', prompt_lower)
+    print(f"[PIPELINE] _match_explicit_visuals: regex found table_nums={table_nums}, figure_nums={figure_nums}")
+
+    for num in table_nums:
+        pattern = f"table {num}"
+        for c in visual_claims:
+            caption = (c.get('text') or '').lower()
+            if c['content_format'] == 'table' and pattern in caption:
+                if c not in matched:
+                    matched.append(c)
+                    print(f"[DEBUG] Explicit match: '{pattern}' → {c['id']}")
+
+    for num in figure_nums:
+        pattern = f"figure {num}"
+        for c in visual_claims:
+            caption = (c.get('text') or '').lower()
+            if c['content_format'] == 'figure' and pattern in caption:
+                if c not in matched:
+                    matched.append(c)
+                    print(f"[DEBUG] Explicit match: '{pattern}' → {c['id']}")
+
+    # 2. Match by keyword in caption: "survival table", "adverse reactions table",
+    #    "Kaplan-Meier figure", "dose reduction table"
+    # Extract key phrases around "table" or "figure" mentions
+    keyword_patterns = re.findall(
+        r'(?:show|display|include|add|render|create)?\s*(?:the\s+)?'
+        r'([\w\s-]+?)\s*(?:table|figure)\b',
+        prompt_lower,
+    )
+    keyword_patterns += re.findall(
+        r'\b(?:table|figure)\s+(?:of|for|about|showing|with)\s+([\w\s-]+)',
+        prompt_lower,
+    )
+    for phrase in keyword_patterns:
+        phrase = phrase.strip()
+        if not phrase or len(phrase) < 3:
+            continue
+        phrase_words = set(phrase.split())
+        for c in visual_claims:
+            caption = (c.get('text') or '').lower()
+            caption_words = set(re.sub(r'[^a-z0-9\s]', '', caption).split())
+            # Check if the key phrase words appear in the caption
+            overlap = phrase_words & caption_words
+            if len(overlap) >= min(2, len(phrase_words)):
+                if c not in matched:
+                    matched.append(c)
+                    print(f"[DEBUG] Keyword match: '{phrase}' → {c['id']} ({c['text'][:60]})")
+
+    # 3. Generic "show table" / "display the table" without number — match all?
+    #    No, too broad. Only if there's exactly one table claim, or skip.
+    if not matched and re.search(r'\b(?:show|display|include)\s+(?:the\s+)?table\b', prompt_lower):
+        # User wants "the table" but didn't specify which — check if topic narrows it
+        print(f"[DEBUG] Generic 'show table' request — will rely on prefilter/selection")
+
+    print(f"[PIPELINE] _match_explicit_visuals: {len(matched)} matches → {[c['id'] for c in matched]}")
+    return matched
+
+
 def generate_slide_spec(
     prompt: str,
     claims: list,
@@ -2010,6 +2259,14 @@ def generate_slide_spec(
     Step 0: Narrative plan → per-slide loop (1a: prefilter, 1b: select, 2+3+4: build).
     Returns the parsed slide spec dict.
     """
+    print(f"[PIPELINE] generate_slide_spec: prompt=\"{prompt[:120]}\"")
+    print(f"[PIPELINE] generate_slide_spec: {len(claims)} total claims")
+    # Step -1: Detect explicit visual references in the user prompt
+    pinned_visuals = _match_explicit_visuals(prompt, claims)
+    pinned_ids = {c['id'] for c in pinned_visuals}
+    if pinned_visuals:
+        print(f"[DEBUG] Pinned {len(pinned_visuals)} visual claims from prompt: {[c['id'] for c in pinned_visuals]}")
+
     # Step 0: Plan narrative
     plan = _plan_narrative(prompt, claims, brand_guidelines,
                            target_audience, audience_rules, history,
@@ -2017,17 +2274,65 @@ def generate_slide_spec(
 
     slide_plans = plan.get('slides', [])
 
+    # Decide which slide each pinned visual belongs to (best-match, one visual per slide max).
+    # Score each (pinned_visual, slide_plan) pair and assign greedily.
+    pinned_assignment = {}  # slide_idx → list of pinned claim dicts
+    if pinned_visuals:
+        unassigned = list(pinned_visuals)
+        for pv in unassigned:
+            pv_text = (pv.get('text') or '').lower()
+            pv_section = (pv.get('section') or '').lower()
+            best_idx, best_score = 0, -1
+            for si, sp in enumerate(slide_plans):
+                topic = (sp.get('topic') or '').lower()
+                section = (sp.get('section') or '').lower()
+                score = 0
+                # Check if topic mentions the table/figure by number
+                for ref in re.findall(r'(?:table|figure)\s*\d+', topic):
+                    if ref in pv_text:
+                        score += 20
+                # Keyword overlap between topic and caption
+                topic_words = set(re.sub(r'[^a-z0-9\s]', '', topic).split())
+                pv_words = set(re.sub(r'[^a-z0-9\s]', '', pv_text).split())
+                score += len(topic_words & pv_words) * 2
+                # Section match
+                if section and pv_section and section in pv_section:
+                    score += 5
+                if score > best_score:
+                    best_score = score
+                    best_idx = si
+            pinned_assignment.setdefault(best_idx, []).append(pv)
+            print(f"[DEBUG] Pinned visual {pv['id']} assigned to slide {best_idx} (score={best_score})")
+
     def _process_slide(idx_and_plan):
         idx, slide_plan = idx_and_plan
         topic = slide_plan['topic']
         print(f"[DEBUG] Processing slide {idx}: {topic}")
 
+        # Pinned visuals for THIS slide only
+        slide_pinned = pinned_assignment.get(idx, [])
+
         # Step 1a: Programmatic pre-filter
         candidates = _prefilter_claims(claims, slide_plan)
+
+        # Ensure this slide's pinned visuals are in candidates
+        candidate_ids = {c['id'] for c in candidates}
+        for pv in slide_pinned:
+            if pv['id'] not in candidate_ids:
+                candidates.append(pv)
+                print(f"[DEBUG] Injected pinned visual into candidates: {pv['id']}")
+
         print(f"[DEBUG] Pre-filtered {len(candidates)} candidates for '{topic}'")
 
         # Step 1b: LLM strict selection
         selected = _select_claims(topic, candidates)
+
+        # Ensure this slide's pinned visuals are in the selection
+        selected_ids = {s['claim_id'] for s in selected}
+        for pv in slide_pinned:
+            if pv['id'] not in selected_ids:
+                selected.append({'claim_id': pv['id'], 'role': 'supporting'})
+                print(f"[DEBUG] Force-added pinned visual to selection: {pv['id']}")
 
         # Steps 2+3+4: Build slide
         slide = _build_slide(topic, selected, claims,
@@ -2035,6 +2340,11 @@ def generate_slide_spec(
         if on_slide_ready:
             on_slide_ready(idx, slide)
         return idx, slide
+
+    # Log pinned assignments summary
+    if pinned_assignment:
+        for si, pvs in pinned_assignment.items():
+            print(f"[PIPELINE] generate_slide_spec: slide {si} pinned visuals: {[pv['id'] for pv in pvs]}")
 
     # Run slides in parallel — each slide's LLM calls are independent
     slides = [None] * len(slide_plans)
@@ -2047,6 +2357,12 @@ def generate_slide_spec(
             idx, slide = future.result()
             slides[idx] = slide
 
+    # Per-slide summary
+    for i, s in enumerate(slides):
+        layout = s.get('layout', '?') if s else '?'
+        body_count = len(s.get('body_claims', [])) if s else 0
+        title = s.get('slide_title', '') if s else ''
+        print(f"[PIPELINE] generate_slide_spec: slide {i} → layout={layout}, body_claims={body_count}, title=\"{title[:60]}\"")
     return {"slides": slides}
 
 

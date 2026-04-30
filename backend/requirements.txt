@@ -6,6 +6,7 @@ flask-migrate==4.0.7
 flask-admin==1.6.1
 psycopg[binary]==3.2.4
 anthropic>=0.40.0
+openai>=1.0.0
 pypdf==6.9.2
 python-dotenv==1.0.1
 werkzeug==3.0.3

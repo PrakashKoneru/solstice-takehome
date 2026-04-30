@@ -77,6 +77,28 @@ Rules:
 - Extract ALL claims — do not skip any factual statement."""
 
 
+def _normalize_for_match(text: str) -> str:
+    """Collapse whitespace and lowercase for verbatim matching."""
+    return re.sub(r'\s+', ' ', text.lower().strip())
+
+
+def _is_verbatim(claim_text: str, source_text: str) -> bool:
+    """Return True if claim_text appears as a verbatim substring in source_text.
+
+    Checks with whitespace-normalized comparison first, then falls back to
+    an alphanumeric-only comparison to tolerate minor punctuation differences
+    from PDF extraction (e.g. curly quotes, em-dashes).
+    """
+    claim_norm = _normalize_for_match(claim_text)
+    source_norm = _normalize_for_match(source_text)
+    if claim_norm in source_norm:
+        return True
+    # Fallback: strip all punctuation, keep only alphanumeric + spaces
+    claim_stripped = re.sub(r'[^a-z0-9\s]', '', claim_norm)
+    source_stripped = re.sub(r'[^a-z0-9\s]', '', source_norm)
+    return claim_stripped in source_stripped
+
+
 def _make_id(text: str, claim_type: str, seq: int) -> str:
     """Generate a stable human-readable claim ID."""
     words = re.sub(r'[^a-z0-9\s]', '', text.lower()).split()
@@ -97,10 +119,17 @@ def _deduplicate(claims: list) -> list:
     return result
 
 
-def _extract_claims_from_page(client, page_text: str, page_number: int) -> list:
-    """Send one page to Claude and return list of claim dicts with ground-truth page_number."""
+def _extract_claims_from_page(client, page_text: str, page_number: int, verbatim_text: str = None) -> list:
+    """Send one page to Claude and return list of claim dicts with ground-truth page_number.
+
+    Args:
+        verbatim_text: If provided, the verbatim gate checks against this text instead of page_text.
+                       Used to pass table-free text so table-derived claims get rejected.
+    """
     if not page_text.strip():
         return []
+
+    gate_text = verbatim_text if verbatim_text is not None else page_text
 
     try:
         with client.messages.stream(
@@ -125,30 +154,54 @@ def _extract_claims_from_page(client, page_text: str, page_number: int) -> list:
                 # Override page_number with ground-truth from PDF index
                 for c in claims:
                     c['page_number'] = page_number
-                logger.info("Page %d: extracted %d claims", page_number, len(claims))
-                return claims
+                # Verbatim gate: reject any claim whose text is not in the source
+                # When verbatim_text is provided (table-free), claims fabricated
+                # from table cells will fail this check
+                verified = []
+                for c in claims:
+                    if _is_verbatim(c['text'], gate_text):
+                        verified.append(c)
+                    else:
+                        logger.warning(
+                            "Page %d: REJECTED non-verbatim claim: %s",
+                            page_number, c['text'][:120],
+                        )
+                logger.info(
+                    "Page %d: extracted %d claims, %d passed verbatim check",
+                    page_number, len(claims), len(verified),
+                )
+                return verified
     except Exception as e:
         logger.error("Page %d extraction failed: %s", page_number, e)
     return []
 
 
-def extract_claims_streaming(pages: list, knowledge_id: int, app, on_page_done=None) -> list:
+def extract_claims_streaming(pages: list, knowledge_id: int, app, on_page_done=None, verbatim_pages=None) -> list:
     """
     Extract claims from pages in parallel using ThreadPoolExecutor.
     pages: list of {"page_number": int, "text": str}
     app: Flask app for DB context in background thread
     on_page_done: optional callback(page_number, page_claims) called as each page completes
+    verbatim_pages: optional table-free pages for verbatim gate checking
     Returns list of claim dicts ready for DB insertion.
     """
     from services.claude_service import _get_client
     client = _get_client()
+
+    # Build page_number -> table-free text lookup for verbatim gate
+    verbatim_lookup = {}
+    if verbatim_pages:
+        verbatim_lookup = {p['page_number']: p['text'] for p in verbatim_pages}
 
     all_claims = []
     max_workers = min(5, len(pages))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_page = {
-            executor.submit(_extract_claims_from_page, client, p['text'], p['page_number']): p['page_number']
+            executor.submit(
+                _extract_claims_from_page, client, p['text'], p['page_number'],
+                verbatim_text=verbatim_lookup.get(p['page_number']),
+            ): p['page_number']
             for p in pages
         }
 
@@ -182,31 +235,114 @@ def extract_claims_streaming(pages: list, knowledge_id: int, app, on_page_done=N
     return result
 
 
-def assign_sections_to_claims(claims: list, doc_outline: list) -> list:
-    """Post-process claims: assign section from doc_outline based on page_number.
-    Walks outline entries sorted by page, assigns the most recent level 1-2 header.
+def _section_number(title: str) -> Optional[str]:
+    """Extract leading numbered prefix like '5.1' from '5.1. Hypertension'."""
+    m = re.match(r'^(\d+(?:\.\d+)*)', title.strip())
+    return m.group(1) if m else None
+
+
+def _is_non_section_entry(title: str) -> bool:
+    """Filter out non-section outline entries: table captions and dashed highlight box headers."""
+    t = title.strip()
+    # Table/Figure captions like "Table 1: Recommended Dosage"
+    if re.match(r'^(Table|Figure)\s+\d+', t, re.IGNORECASE):
+        return True
+    # Dashed highlight-box entries like "--- ADVERSE REACTIONS ---"
+    if t.startswith('-') and t.endswith('-'):
+        return True
+    # Misc non-section entries (distributor info, etc.)
+    if t.startswith('Distributed by') or t.startswith('Takeda'):
+        return True
+    return False
+
+
+def _build_section_tree(doc_outline: list) -> dict:
+    """Build a lookup: page_number → section_hierarchy list (full ancestor chain).
+
+    Parses numbered prefixes to infer parent-child relationships:
+      '5.1' → parent '5', '6.3.2' → parent '6.3' → grandparent '6'
+    Unnumbered entries become children of the last numbered entry before them.
+
+    Returns: {page_number: [("14. CLINICAL STUDIES", page), ("14.1. mCRC", page), ("FRESCO-2 Study", page)], ...}
+    Each value is a list of (title, page) tuples representing entries up to that page.
     """
+    # Sort by page, then by position in original outline (preserves document order)
+    sorted_entries = sorted(
+        [(i, e) for i, e in enumerate(doc_outline) if not _is_non_section_entry(e.get('title', ''))],
+        key=lambda x: (x[1].get('page', 0), x[0])
+    )
+
+    # Build a map from section number → entry for parent lookups
+    numbered_entries = {}  # number → (title, page)
+    all_entries = []       # ordered list of (title, page, number_or_None)
+
+    for _, entry in sorted_entries:
+        title = entry.get('title', '').strip()
+        page = entry.get('page', 0)
+        num = _section_number(title)
+        if num:
+            numbered_entries[num] = (title, page)
+        all_entries.append((title, page, num))
+
+    def _get_ancestors(title, num):
+        """Walk up the number hierarchy to build the ancestor chain."""
+        chain = []
+        if num:
+            # e.g. num='6.3.2' → try '6.3', then '6'
+            parts = num.split('.')
+            for depth in range(1, len(parts)):
+                parent_num = '.'.join(parts[:depth])
+                if parent_num in numbered_entries:
+                    chain.append(numbered_entries[parent_num][0])
+        chain.append(title)
+        return chain
+
+    # For each entry, compute its full hierarchy
+    # Then build page→hierarchy by tracking the deepest entry at or before each page
+    entry_hierarchies = []  # (page, hierarchy_list)
+    last_numbered_title = None
+    last_numbered_num = None
+
+    for title, page, num in all_entries:
+        if num:
+            hierarchy = _get_ancestors(title, num)
+            last_numbered_title = title
+            last_numbered_num = num
+        else:
+            # Unnumbered entry — child of the last numbered entry before it
+            if last_numbered_num:
+                hierarchy = _get_ancestors(last_numbered_title, last_numbered_num)
+                hierarchy.append(title)
+            else:
+                hierarchy = [title]
+        entry_hierarchies.append((page, hierarchy))
+
+    return entry_hierarchies
+
+
+def assign_sections_to_claims(claims: list, doc_outline: list) -> list:
+    """Assign section_hierarchy (full ancestor chain) and section (leaf) to each claim."""
     if not doc_outline:
         return claims
 
-    # Sort outline by page, filter to level 1-2
-    sorted_outline = sorted(
-        [e for e in doc_outline if e.get('level', 1) <= 2],
-        key=lambda e: e.get('page', 0)
-    )
-    if not sorted_outline:
+    entry_hierarchies = _build_section_tree(doc_outline)
+    if not entry_hierarchies:
         return claims
 
     for claim in claims:
         page = claim.get('page_number') or 0
-        section = None
-        for entry in sorted_outline:
-            if entry.get('page', 0) <= page:
-                section = entry.get('title')
+
+        # Find the deepest entry at or before this claim's page
+        best_hierarchy = None
+        for entry_page, hierarchy in entry_hierarchies:
+            if entry_page <= page:
+                best_hierarchy = hierarchy
             else:
                 break
-        if section:
-            claim['section'] = section
+
+        if best_hierarchy:
+            claim['section_hierarchy'] = best_hierarchy
+            claim['section'] = best_hierarchy[-1]  # leaf for backward compat
 
     return claims
 

@@ -536,6 +536,46 @@ def extract_assets_from_pdf(filepath: str, output_dir: str, brand_guidelines=Non
     return assets
 
 
+# Regex to detect section numbering like "1.", "2.1.", "12.3.", "5.12."
+_SECTION_NUM_RE = _re.compile(r'^(\d+(?:\.\d+)*)\.?\s')
+
+
+def _infer_heading_level(title: str, docling_level) -> int:
+    """Infer heading level from section numbering in the title.
+
+    Examples:
+        "1. INDICATIONS AND USAGE"           → level 1
+        "2.1.  Recommended Dosage"           → level 2
+        "12.3. Pharmacokinetics"             → level 2
+        "HIGHLIGHTS OF PRESCRIBING INFO"     → level 1  (no number, top-level)
+        "FRESCO-2 Study"                     → level 3  (no number, unnumbered sub-heading)
+        "Table 1: Recommended Dose..."       → level 3  (table reference)
+    """
+    # If Docling returned a real level > 1, trust it
+    if isinstance(docling_level, int) and docling_level > 1:
+        return docling_level
+
+    # Strip decorative dashes from prescribing info highlights
+    clean = _re.sub(r'-{2,}', '', title).strip()
+
+    # Try to extract section number
+    m = _SECTION_NUM_RE.match(clean)
+    if m:
+        num = m.group(1)
+        # Count dots to determine depth: "5" → 1, "5.1" → 2, "5.1.1" → 3
+        return num.count('.') + 1
+
+    # ALL-CAPS titles without numbers are top-level sections
+    # e.g. "FULL PRESCRIBING INFORMATION", "CONTRAINDICATIONS"
+    alpha = _re.sub(r'[^a-zA-Z]', '', clean)
+    if alpha and alpha == alpha.upper() and len(alpha) > 3:
+        return 1
+
+    # Everything else (unnumbered mixed-case like "FRESCO-2 Study",
+    # "Table 1: ...", "Moderate CYP3A Inducers") is a sub-heading
+    return 3
+
+
 def parse_document_docling(filepath: str, upload_dir: str) -> dict:
     """
     Full Docling parse of a KB document. Returns structured text, tables, figures,
@@ -575,7 +615,8 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
     doc_result = converter.convert(filepath)
 
     # Accumulators
-    page_texts = defaultdict(list)  # page_number -> list of text chunks
+    page_texts = defaultdict(list)  # page_number -> list of text chunks (includes table markdown)
+    page_texts_no_tables = defaultdict(list)  # same but without table markdown (for claim extraction)
     doc_outline = []
     tables = []
     figures = []
@@ -588,38 +629,51 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
         if isinstance(item, SectionHeaderItem):
             title = item.text.strip()
             if title:
-                level = _level if isinstance(_level, int) and _level > 0 else 1
+                level = _infer_heading_level(title, _level)
                 doc_outline.append({"title": title, "page": page_no, "level": level})
                 current_section = title
                 page_texts[page_no].append(f"## {title}")
+                page_texts_no_tables[page_no].append(f"## {title}")
 
         elif isinstance(item, TextItem):
             text = item.text.strip()
             if text:
                 page_texts[page_no].append(text)
+                page_texts_no_tables[page_no].append(text)
 
         elif isinstance(item, ListItem):
             text = item.text.strip()
             if text:
                 page_texts[page_no].append(f"- {text}")
+                page_texts_no_tables[page_no].append(f"- {text}")
 
         elif isinstance(item, TableItem):
             tbl_idx += 1
             try:
                 md = item.export_to_markdown()
                 caption = f"Table {tbl_idx}"
-                # Try to use preceding text as caption
+                context_lines = []
+                # Gather up to 3 preceding text lines for context
                 page_content = page_texts.get(page_no, [])
                 if page_content:
-                    last_line = page_content[-1].strip()
-                    if last_line.lower().startswith("table") or len(last_line) < 120:
-                        caption = last_line
+                    for line in page_content[-3:]:
+                        line = line.strip()
+                        if line and len(line) > 10:
+                            context_lines.append(line)
+                    # Pick the best caption: prefer lines mentioning "table N"
+                    for line in reversed(context_lines):
+                        if _re.search(r'table\s*' + str(tbl_idx), line, _re.IGNORECASE):
+                            caption = line
+                            break
+                        elif line.lower().startswith("table") or len(line) < 120:
+                            caption = line
                 table_json = _parse_markdown_table(md)
                 tables.append({
                     "page_number": page_no,
                     "markdown": md,
                     "table_json": table_json,
                     "caption": caption,
+                    "context": " ".join(context_lines),
                     "section": current_section,
                 })
                 if table_json:
@@ -710,11 +764,32 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
             "text": "\n\n".join(page_texts[pg]),
         })
 
+    # Build table-free pages for claim extraction (tables handled separately as content_format='table')
+    pages_text_only = []
+    for pg in sorted(page_texts_no_tables.keys()):
+        pages_text_only.append({
+            "page_number": pg,
+            "text": "\n\n".join(page_texts_no_tables[pg]),
+        })
+
+    # Embed doc_outline heading titles for semantic search
+    if doc_outline:
+        try:
+            from services.embedding_service import embed_texts
+            heading_titles = [entry['title'] for entry in doc_outline]
+            heading_embeddings = embed_texts(heading_titles)
+            for entry, emb in zip(doc_outline, heading_embeddings):
+                entry['embedding'] = emb
+            print(f"[DOCLING-KB] Embedded {len(heading_embeddings)} outline headings")
+        except Exception as e:
+            print(f"[DOCLING-KB] Heading embedding failed (non-fatal): {e}")
+
     print(f"[DOCLING-KB] Done. {len(pages)} pages, {len(doc_outline)} outline entries, "
           f"{len(tables)} tables, {len(figures)} figures")
 
     return {
         "pages": pages,
+        "pages_text_only": pages_text_only,
         "doc_outline": doc_outline,
         "tables": tables,
         "figures": figures,

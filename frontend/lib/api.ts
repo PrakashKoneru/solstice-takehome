@@ -127,6 +127,8 @@ export type Claim = {
   page_number: number | null
   numeric_values: { value: string; unit?: string; label: string }[]
   tags: string[]
+  section?: string
+  section_hierarchy?: string[]
   is_approved: boolean
   created_at: string
 }

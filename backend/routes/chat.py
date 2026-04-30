@@ -15,6 +15,79 @@ from services.renderer.renderer import render_deck
 chat_bp = Blueprint('chat', __name__)
 
 
+def _strip_outline_embeddings(outlines):
+    return [{k: v for k, v in entry.items() if k != 'embedding'} for entry in outlines]
+
+
+def _filter_claims_by_embedding(prompt: str, claims_list: list, doc_outlines: list,
+                                heading_top_k: int = 5, claim_top_k: int = 20) -> list:
+    """Use embedding similarity to select only relevant claims for a prompt.
+
+    Strategy:
+    1. Embed the prompt
+    2. Match against heading embeddings → expand via section_hierarchy (children only)
+    3. Match against claim embeddings directly
+    4. Union of both sets
+
+    Returns filtered claims list. Falls back to all claims if embeddings are missing.
+    """
+    try:
+        from services.embedding_service import embed_texts, search_embeddings
+    except Exception:
+        return claims_list
+
+    def _strip_embeddings(cl):
+        return [{k: v for k, v in c.items() if k != 'embedding'} for c in cl]
+
+    # Check if any claims/headings have embeddings
+    claims_with_emb = [c for c in claims_list if c.get('embedding')]
+    headings_with_emb = [h for h in doc_outlines if h.get('embedding')]
+
+    if not claims_with_emb and not headings_with_emb:
+        print(f"[EMBED-FILTER] No embeddings found, passing all {len(claims_list)} claims")
+        return _strip_embeddings(claims_list)
+
+    try:
+        query_emb = embed_texts([prompt])[0]
+    except Exception as e:
+        print(f"[EMBED-FILTER] Failed to embed prompt: {e}")
+        return _strip_embeddings(claims_list)
+
+    selected_ids = set()
+
+    # Match headings → expand to child claims via section_hierarchy
+    if headings_with_emb:
+        top_headings = search_embeddings(query_emb, headings_with_emb, top_k=heading_top_k)
+        matched_titles = [(h['title'], h.get('level', 1), h['similarity']) for h in top_headings
+                          if h['similarity'] > 0.3]
+        print(f"[EMBED-FILTER] Top heading matches: {[(t, f'{s:.3f}') for t, _, s in matched_titles]}")
+
+        for title, level, sim in matched_titles:
+            for claim in claims_list:
+                hierarchy = claim.get('section_hierarchy') or []
+                section = claim.get('section') or ''
+                # Check if this claim falls under the matched heading
+                if title in hierarchy or title == section:
+                    selected_ids.add(claim['id'])
+
+    # Direct claim matches
+    if claims_with_emb:
+        top_claims = search_embeddings(query_emb, claims_with_emb, top_k=claim_top_k)
+        for c in top_claims:
+            if c['similarity'] > 0.3:
+                selected_ids.add(c['id'])
+                print(f"[EMBED-FILTER] Direct claim match: {c['id']} (sim={c['similarity']:.3f})")
+
+    if not selected_ids:
+        print(f"[EMBED-FILTER] No matches above threshold, passing all {len(claims_list)} claims")
+        return _strip_embeddings(claims_list)
+
+    filtered = [{k: v for k, v in c.items() if k != 'embedding'}
+                for c in claims_list if c['id'] in selected_ids]
+    print(f"[EMBED-FILTER] Filtered {len(claims_list)} → {len(filtered)} claims for prompt: \"{prompt[:80]}\"")
+    return filtered
+
+
 @chat_bp.route('/api/sessions/<int:session_id>/restore', methods=['POST'])
 def restore_version(session_id):
     ChatSession.query.get_or_404(session_id)
@@ -332,7 +405,7 @@ def send_message(session_id):
         for item in items:
             if item.doc_outline:
                 doc_outlines.extend(item.doc_outline)
-    combined_outline = doc_outlines if doc_outlines else None
+    combined_outline = _strip_outline_embeddings(doc_outlines) if doc_outlines else None
 
     # Retrieve previous spec and HTML from last generation (if any)
     prev_spec = None
@@ -345,7 +418,10 @@ def send_message(session_id):
             break
 
     # ── Orchestrator ──────────────────────────────────────────────────────────
+    print(f"[PIPELINE:{session_id}] Incoming prompt: \"{prompt[:120]}\"")
+    print(f"[PIPELINE:{session_id}] selected_docs={kb_doc_ids}, has_deck={bool(prev_spec)}, has_kb={bool(kb_texts)}")
     ops = orchestrate(prompt, slim_history, has_kb=bool(kb_texts), has_deck=bool(prev_spec))
+    print(f"[PIPELINE:{session_id}] Orchestrator decision: {ops}")
 
     html_content  = None
     review_report = None
@@ -424,6 +500,7 @@ def send_message(session_id):
                 pass
 
     # ── Edit path ─────────────────────────────────────────────────────────────
+    print(f"[PIPELINE:{session_id}] Executing path: {'edit' if 'edit' in ops else 'generate' if 'generate' in ops else 'chat'}")
     if 'edit' in ops:
         if not prev_spec:
             chat_text = "There's no existing deck to edit yet. Try asking me to generate a new deck first."
@@ -466,6 +543,11 @@ def send_message(session_id):
                 Claim.is_approved == True,
             ).all()
             claims_list = [c.to_dict() for c in claims]
+            # Attach embeddings for filtering (not included in to_dict)
+            emb_map = {c.id: c.embedding for c in claims if c.embedding}
+            for cd in claims_list:
+                if cd['id'] in emb_map:
+                    cd['embedding'] = emb_map[cd['id']]
 
             if not claims_list:
                 chat_text = (
@@ -474,10 +556,14 @@ def send_message(session_id):
                 )
             else:
                 claims_by_id = {c['id']: c for c in claims_list}
+                # Filter claims by embedding similarity
+                filtered_claims = _filter_claims_by_embedding(
+                    prompt, claims_list, doc_outlines,
+                )
                 try:
                     print(f"[DEBUG] Using generate_slide_spec path (fresh generation)")
                     spec = generate_slide_spec(
-                        prompt, claims_list, brand_guidelines,
+                        prompt, filtered_claims, brand_guidelines,
                         target_audience, audience_rules, slim_history,
                         component_patterns=component_patterns,
                         doc_outline=combined_outline,
@@ -518,6 +604,11 @@ def send_message(session_id):
             )
         except Exception:
             chat_text = 'Slides generated — check the output panel.'
+
+    print(f"[PIPELINE:{session_id}] Result: html={'yes' if html_content else 'no'} ({len(html_content) if html_content else 0} chars), chat={'yes' if chat_text else 'no'}")
+    if review_report and 'spec' in review_report:
+        spec_slides = review_report['spec'].get('slides', [])
+        print(f"[PIPELINE:{session_id}] Spec: {len(spec_slides)} slides, layouts={[s.get('layout') for s in spec_slides]}")
 
     assistant_msg = Message(
         session_id=session_id,
@@ -596,7 +687,7 @@ def send_message_stream(session_id):
         for item in items:
             if item.doc_outline:
                 stream_doc_outlines.extend(item.doc_outline)
-    stream_outline = stream_doc_outlines if stream_doc_outlines else None
+    stream_outline = _strip_outline_embeddings(stream_doc_outlines) if stream_doc_outlines else None
 
     prev_spec = None
     prev_html = None
@@ -612,7 +703,10 @@ def send_message_stream(session_id):
     db.session.add(user_msg)
     db.session.commit()
 
+    print(f"[PIPELINE:{session_id}] [stream] Incoming prompt: \"{prompt[:120]}\"")
+    print(f"[PIPELINE:{session_id}] [stream] selected_docs={kb_doc_ids}, has_deck={bool(prev_spec)}, has_kb={bool(kb_texts)}")
     ops = orchestrate(prompt, slim_history, has_kb=bool(kb_texts), has_deck=bool(prev_spec))
+    print(f"[PIPELINE:{session_id}] [stream] Orchestrator decision: {ops}")
 
     # Event queue for cross-thread communication
     eq = queue.Queue()
@@ -634,6 +728,11 @@ def send_message_stream(session_id):
                     Claim.is_approved == True,
                 ).all()
                 claims_list = [c.to_dict() for c in claims]
+                # Attach embeddings for filtering (not included in to_dict)
+                emb_map = {c.id: c.embedding for c in claims if c.embedding}
+                for cd in claims_list:
+                    if cd['id'] in emb_map:
+                        cd['embedding'] = emb_map[cd['id']]
                 claims_by_id = {c['id']: c for c in claims_list}
 
             if not claims_list and ('generate' in ops or 'edit' in ops):
@@ -699,11 +798,16 @@ def send_message_stream(session_id):
                 elif 'generate' in ops:
                     eq.put(('status', {'step': 'Planning narrative...'}))
 
+                    # Filter claims by embedding similarity
+                    filtered_claims = _filter_claims_by_embedding(
+                        prompt, claims_list, stream_doc_outlines,
+                    )
+
                     def _on_slide_ready(idx, slide):
                         eq.put(('slide_ready', {'index': idx, 'layout': slide.get('layout', ''), 'title': slide.get('slide_title', '')}))
 
                     spec = generate_slide_spec(
-                        prompt, claims_list, brand_guidelines,
+                        prompt, filtered_claims, brand_guidelines,
                         target_audience, audience_rules, slim_history,
                         component_patterns=component_patterns,
                         on_slide_ready=_on_slide_ready,

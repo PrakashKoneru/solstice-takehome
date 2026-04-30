@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import logging
@@ -8,7 +9,7 @@ from werkzeug.utils import secure_filename
 from extensions import db
 from models import KnowledgeItem, Claim
 from services.pdf_service import extract_text_from_pdf, extract_text_by_page, parse_document_docling
-from services.claim_extractor import extract_claims_streaming, assign_sections_to_claims
+from services.claim_extractor import extract_claims_streaming, assign_sections_to_claims, _is_verbatim
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,7 @@ def list_knowledge():
     return jsonify(result)
 
 
-def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=None):
+def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=None, pages_text_only=None):
     """Background thread: extract claims page-by-page and write to DB,
     then create table and figure claims from Docling output."""
     with app.app_context():
@@ -66,44 +67,73 @@ def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=No
                                 numeric_values=c.get('numeric_values', []),
                                 tags=c.get('tags', []),
                                 section=c.get('section'),
+                                section_hierarchy=c.get('section_hierarchy'),
                                 is_approved=True,
                             ))
                     db.session.commit()
                     logger.info("Page %d: wrote %d claims to DB for item %d", page_num, len(page_claims), item_id)
 
-            claims_data = extract_claims_streaming(pages, item_id, app, on_page_done=on_page_done)
+            claims_data = extract_claims_streaming(pages, item_id, app, on_page_done=on_page_done, verbatim_pages=pages_text_only)
 
             # Create table claims from Docling output
             if docling_tables:
                 from services.claim_extractor import _make_id
+                # Build claim dicts first so we can assign sections before DB insert
                 table_claim_dicts = []
                 for t_idx, tbl in enumerate(docling_tables):
-                    claim_id = _make_id(tbl['caption'], 'stat', 90000 + t_idx)
-                    existing = db.session.get(Claim, claim_id)
+                    caption = tbl['caption']
+                    context = tbl.get('context', '')
+                    if re.match(r'^(##\s*)?Table\s+\d+\s*$', caption, re.IGNORECASE) and context:
+                        claim_text = context
+                    else:
+                        claim_text = caption
+
+                    stop_words = {'table', 'the', 'and', 'for', 'from', 'with', 'that', 'this', 'were', 'was', 'are', 'have', 'been'}
+                    tags = ['table']
+                    caption_words = re.sub(r'[^a-z\s]', '', caption.lower()).split()
+                    tags.extend([w for w in caption_words if len(w) > 3 and w not in stop_words])
+                    if context:
+                        context_words = re.sub(r'[^a-z\s]', '', context.lower()).split()
+                        tags.extend([w for w in context_words if len(w) > 3 and w not in stop_words])
+                    if tbl.get('table_json') and tbl['table_json'].get('headers'):
+                        for h in tbl['table_json']['headers']:
+                            header_words = re.sub(r'[^a-z\s]', '', h.lower()).split()
+                            tags.extend([w for w in header_words if len(w) > 3 and w not in stop_words])
+                    tags = list(set(tags))
+
+                    table_claim_dicts.append({
+                        'claim_id': _make_id(claim_text, 'stat', 90000 + t_idx),
+                        'text': claim_text,
+                        'claim_type': 'stat',
+                        'page_number': tbl['page_number'],
+                        'tags': tags,
+                        'markdown': tbl['markdown'],
+                        'table_json': tbl.get('table_json'),
+                        'figure_url': tbl.get('figure_url'),
+                    })
+
+                # Assign hierarchical sections before creating DB objects
+                if doc_outline:
+                    assign_sections_to_claims(table_claim_dicts, doc_outline)
+
+                for td in table_claim_dicts:
+                    existing = db.session.get(Claim, td['claim_id'])
                     if not existing:
-                        claim_dict = {
-                            'text': tbl['caption'],
-                            'claim_type': 'stat',
-                            'page_number': tbl['page_number'],
-                            'section': tbl.get('section'),
-                        }
-                        table_claim_dicts.append(claim_dict)
                         db.session.add(Claim(
-                            id=claim_id,
+                            id=td['claim_id'],
                             knowledge_id=item_id,
-                            text=tbl['caption'],
+                            text=td['text'],
                             claim_type='stat',
                             content_format='table',
-                            table_markdown=tbl['markdown'],
-                            table_json=tbl.get('table_json'),
-                            figure_url=tbl.get('figure_url'),
-                            page_number=tbl['page_number'],
-                            section=tbl.get('section'),
-                            tags=['table'],
+                            table_markdown=td['markdown'],
+                            table_json=td.get('table_json'),
+                            figure_url=td.get('figure_url'),
+                            page_number=td['page_number'],
+                            section=td.get('section'),
+                            section_hierarchy=td.get('section_hierarchy'),
+                            tags=td['tags'],
                             is_approved=True,
                         ))
-                if doc_outline and table_claim_dicts:
-                    assign_sections_to_claims(table_claim_dicts, doc_outline)
                 db.session.commit()
                 logger.info("Created %d table claims for item %d", len(docling_tables), item_id)
 
@@ -113,33 +143,50 @@ def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=No
                 figure_claim_dicts = []
                 for f_idx, fig in enumerate(docling_figures):
                     caption = fig.get('caption') or f"Figure {f_idx + 1}"
-                    figure_url = fig.get('figure_url', '')
-                    claim_id = _make_id(caption, 'stat', 80000 + f_idx)
-                    existing = db.session.get(Claim, claim_id)
+                    figure_claim_dicts.append({
+                        'claim_id': _make_id(caption, 'stat', 80000 + f_idx),
+                        'text': caption,
+                        'claim_type': 'stat',
+                        'page_number': fig['page_number'],
+                        'figure_url': fig.get('figure_url', ''),
+                    })
+
+                # Assign hierarchical sections before creating DB objects
+                if doc_outline:
+                    assign_sections_to_claims(figure_claim_dicts, doc_outline)
+
+                for fd in figure_claim_dicts:
+                    existing = db.session.get(Claim, fd['claim_id'])
                     if not existing:
-                        claim_dict = {
-                            'text': caption,
-                            'claim_type': 'stat',
-                            'page_number': fig['page_number'],
-                            'section': fig.get('section'),
-                        }
-                        figure_claim_dicts.append(claim_dict)
                         db.session.add(Claim(
-                            id=claim_id,
+                            id=fd['claim_id'],
                             knowledge_id=item_id,
-                            text=caption,
+                            text=fd['text'],
                             claim_type='stat',
                             content_format='figure',
-                            figure_url=figure_url,
-                            page_number=fig['page_number'],
-                            section=fig.get('section'),
+                            figure_url=fd['figure_url'],
+                            page_number=fd['page_number'],
+                            section=fd.get('section'),
+                            section_hierarchy=fd.get('section_hierarchy'),
                             tags=['figure'],
                             is_approved=True,
                         ))
-                if doc_outline and figure_claim_dicts:
-                    assign_sections_to_claims(figure_claim_dicts, doc_outline)
                 db.session.commit()
                 logger.info("Created %d figure claims for item %d", len(docling_figures), item_id)
+
+            # Embed all claims for semantic search
+            try:
+                from services.embedding_service import embed_texts
+                all_claims = Claim.query.filter_by(knowledge_id=item_id).all()
+                claim_texts = [c.text for c in all_claims]
+                if claim_texts:
+                    embeddings = embed_texts(claim_texts)
+                    for claim_obj, emb in zip(all_claims, embeddings):
+                        claim_obj.embedding = emb
+                    db.session.commit()
+                    logger.info("Embedded %d claims for item %d", len(claim_texts), item_id)
+            except Exception as e:
+                logger.warning("Claim embedding failed (non-fatal) for item %d: %s", item_id, e)
 
             item = db.session.get(KnowledgeItem, item_id)
             item.extraction_status = 'complete'
@@ -204,6 +251,7 @@ def upload_knowledge():
         kwargs={
             'docling_tables': docling_result["tables"],
             'docling_figures': docling_result["figures"],
+            'pages_text_only': docling_result.get("pages_text_only"),
         },
         daemon=True,
     )
@@ -328,6 +376,40 @@ def update_claim(item_id, claim_id):
 
     db.session.commit()
     return jsonify(claim.to_dict())
+
+
+@knowledge_bp.route('/purge-non-verbatim', methods=['POST'])
+def purge_non_verbatim():
+    """Delete all text claims whose text is not found verbatim in the source document."""
+    items = KnowledgeItem.query.all()
+    total_checked = 0
+    total_deleted = 0
+    deleted_ids = []
+
+    for item in items:
+        if not item.text_content:
+            continue
+        # Strip markdown table lines from text_content so table-derived claims
+        # are correctly identified as non-verbatim
+        source_lines = item.text_content.split('\n')
+        source_text_no_tables = '\n'.join(
+            line for line in source_lines if not line.startswith('|')
+        )
+        claims = Claim.query.filter_by(knowledge_id=item.id, content_format='text').all()
+        for c in claims:
+            total_checked += 1
+            if not _is_verbatim(c.text, source_text_no_tables):
+                deleted_ids.append(c.id)
+                db.session.delete(c)
+                total_deleted += 1
+
+    db.session.commit()
+    logger.info("Purged %d non-verbatim claims out of %d checked", total_deleted, total_checked)
+    return jsonify({
+        'checked': total_checked,
+        'deleted': total_deleted,
+        'deleted_ids': deleted_ids,
+    })
 
 
 @knowledge_bp.route('/<int:item_id>/claims/<claim_id>', methods=['DELETE'])

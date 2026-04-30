@@ -515,6 +515,16 @@ export default function KnowledgeBasePage() {
                       {claim.source_citation && (
                         <p className="text-xs text-slate-400 mt-0.5">{claim.source_citation}</p>
                       )}
+                      {claim.section_hierarchy && claim.section_hierarchy.length > 0 && (
+                        <div className="flex items-center gap-1 mt-1 flex-wrap">
+                          {claim.section_hierarchy.map((s, i) => (
+                            <span key={i} className="inline-flex items-center text-[10px] text-slate-500">
+                              {i > 0 && <span className="mx-0.5 text-slate-300">›</span>}
+                              <span className="bg-slate-50 border border-slate-200 rounded px-1.5 py-0.5">{s}</span>
+                            </span>
+                          ))}
+                        </div>
+                      )}
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">
                       <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${CLAIM_TYPE_COLORS[claim.claim_type] ?? 'bg-slate-100 text-slate-600'}`}>
