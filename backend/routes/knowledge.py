@@ -174,17 +174,32 @@ def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=No
                 db.session.commit()
                 logger.info("Created %d figure claims for item %d", len(docling_figures), item_id)
 
-            # Embed all claims for semantic search
+            # Embed all claims for semantic search (with section context for better retrieval)
             try:
                 from services.embedding_service import embed_texts
-                all_claims = Claim.query.filter_by(knowledge_id=item_id).all()
-                claim_texts = [c.text for c in all_claims]
-                if claim_texts:
-                    embeddings = embed_texts(claim_texts)
+                all_claims = Claim.query.filter_by(knowledge_id=item_id).order_by(Claim.page_number, Claim.created_at).all()
+                # Build contextual text: section hierarchy + claim text + neighbor preview
+                claim_embed_texts = []
+                for i, c in enumerate(all_claims):
+                    parts = []
+                    if c.section_hierarchy:
+                        parts.append(' > '.join(c.section_hierarchy))
+                    elif c.section:
+                        parts.append(c.section)
+                    parts.append(c.text)
+                    # Add neighbor claim text for context (±1 on same page)
+                    for neighbor_idx in (i - 1, i + 1):
+                        if 0 <= neighbor_idx < len(all_claims):
+                            neighbor = all_claims[neighbor_idx]
+                            if neighbor.page_number == c.page_number:
+                                parts.append(neighbor.text)
+                    claim_embed_texts.append(' | '.join(parts))
+                if claim_embed_texts:
+                    embeddings = embed_texts(claim_embed_texts)
                     for claim_obj, emb in zip(all_claims, embeddings):
                         claim_obj.embedding = emb
                     db.session.commit()
-                    logger.info("Embedded %d claims for item %d", len(claim_texts), item_id)
+                    logger.info("Embedded %d claims (with context) for item %d", len(claim_embed_texts), item_id)
             except Exception as e:
                 logger.warning("Claim embedding failed (non-fatal) for item %d: %s", item_id, e)
 

@@ -1885,7 +1885,8 @@ def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_
 
 
 def _prefilter_claims(claims, slide_plan):
-    """Step 1a: Programmatic pre-filter — narrow claims by type and keyword overlap."""
+    """Step 1a: Programmatic pre-filter — narrow claims by type, keyword overlap, and embedding similarity.
+    Also expands to include neighboring claims (±2 on same page) for context."""
     target_types = set(t.lower() for t in slide_plan.get('claim_types', []))
     # Expand compound keywords: "overall_survival" → {"overall_survival", "overall", "survival"}
     keywords = set()
@@ -1895,6 +1896,25 @@ def _prefilter_claims(claims, slide_plan):
         if '_' in kl:
             keywords.update(kl.split('_'))
     target_section = (slide_plan.get('section') or '').lower().strip()
+
+    # Embedding-based scoring: embed the slide topic and boost claims with high similarity
+    emb_scores = {}  # claim_id → similarity score
+    claims_with_emb = [c for c in claims if c.get('embedding')]
+    if claims_with_emb:
+        try:
+            from services.embedding_service import embed_texts, cosine_similarity
+            topic_text = slide_plan.get('topic', '')
+            if keywords:
+                topic_text += ' ' + ' '.join(keywords)
+            topic_emb = embed_texts([topic_text])[0]
+            for c in claims_with_emb:
+                sim = cosine_similarity(topic_emb, c['embedding'])
+                if sim > 0.25:
+                    emb_scores[c['id']] = sim
+            if emb_scores:
+                print(f"[PREFILTER-EMB] {len(emb_scores)} claims above 0.25 similarity for '{slide_plan.get('topic', '')[:60]}'")
+        except Exception as e:
+            print(f"[PREFILTER-EMB] Embedding scoring failed: {e}")
 
     content_scored = []
     isi_claims = []
@@ -1963,18 +1983,45 @@ def _prefilter_claims(claims, slide_plan):
                     score += 20  # strong signal — user/planner explicitly named this visual
                     break
 
+        # Embedding similarity boost (scaled to 0-12 points for sims 0.25-0.7+)
+        emb_sim = emb_scores.get(c.get('id'), 0)
+        if emb_sim > 0:
+            score += int(emb_sim * 20)  # e.g. 0.5 sim → +10 points
+
         if score > 0 or not keywords:
             content_scored.append((c, score))
 
     # Take top 17 content claims + up to 3 ISI/boilerplate
     content_scored.sort(key=lambda x: x[1], reverse=True)
-    result = [c for c, _ in content_scored[:17]] + isi_claims[:3]
+    top_claims = [c for c, _ in content_scored[:17]]
+
+    # Expand to include ±2 neighboring claims on same page for context
+    top_ids = {c['id'] for c in top_claims}
+    sorted_claims = sorted(
+        [c for c in claims if (c.get('claim_type') or '').lower() not in ('isi', 'boilerplate')],
+        key=lambda c: (c.get('page_number') or 0, c.get('created_at', '')),
+    )
+    expanded_ids = set(top_ids)
+    for i, c in enumerate(sorted_claims):
+        if c['id'] in top_ids:
+            page = c.get('page_number')
+            for offset in (-2, -1, 1, 2):
+                ni = i + offset
+                if 0 <= ni < len(sorted_claims):
+                    neighbor = sorted_claims[ni]
+                    if neighbor.get('page_number') == page:
+                        expanded_ids.add(neighbor['id'])
+
+    neighbor_claims = [c for c in sorted_claims if c['id'] in expanded_ids and c['id'] not in top_ids]
+    result = top_claims + neighbor_claims + isi_claims[:3]
 
     # Debug: log top candidates with scores
     for c, s in content_scored[:17]:
         fmt = c.get('content_format', 'text')
         label = f" [{fmt}]" if fmt != 'text' else ''
         print(f"[DEBUG] Prefilter candidate (score={s}): {c.get('id', '?')}{label} — {c.get('text', '')[:80]}")
+    if neighbor_claims:
+        print(f"[DEBUG] Prefilter: +{len(neighbor_claims)} neighbor claims from same pages")
     if isi_claims:
         print(f"[DEBUG] Prefilter: {len(isi_claims)} ISI/boilerplate claims, including top {min(3, len(isi_claims))}")
     return result

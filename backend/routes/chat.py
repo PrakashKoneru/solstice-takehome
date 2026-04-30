@@ -82,9 +82,25 @@ def _filter_claims_by_embedding(prompt: str, claims_list: list, doc_outlines: li
         print(f"[EMBED-FILTER] No matches above threshold, passing all {len(claims_list)} claims")
         return _strip_embeddings(claims_list)
 
+    # Expand to include neighboring claims (±2 on same page) so the LLM gets surrounding context
+    # Sort by page then position to find neighbors
+    sorted_claims = sorted(claims_list, key=lambda c: (c.get('page_number') or 0, c.get('created_at', '')))
+    expanded_ids = set(selected_ids)
+    for i, c in enumerate(sorted_claims):
+        if c['id'] in selected_ids:
+            page = c.get('page_number')
+            for offset in (-2, -1, 1, 2):
+                ni = i + offset
+                if 0 <= ni < len(sorted_claims):
+                    neighbor = sorted_claims[ni]
+                    if neighbor.get('page_number') == page:
+                        expanded_ids.add(neighbor['id'])
+
     filtered = [{k: v for k, v in c.items() if k != 'embedding'}
-                for c in claims_list if c['id'] in selected_ids]
-    print(f"[EMBED-FILTER] Filtered {len(claims_list)} → {len(filtered)} claims for prompt: \"{prompt[:80]}\"")
+                for c in sorted_claims if c['id'] in expanded_ids]
+    print(f"[EMBED-FILTER] Filtered {len(claims_list)} → {len(filtered)} claims "
+          f"({len(selected_ids)} matched + {len(expanded_ids) - len(selected_ids)} neighbors) "
+          f"for prompt: \"{prompt[:80]}\"")
     return filtered
 
 
@@ -556,14 +572,10 @@ def send_message(session_id):
                 )
             else:
                 claims_by_id = {c['id']: c for c in claims_list}
-                # Filter claims by embedding similarity
-                filtered_claims = _filter_claims_by_embedding(
-                    prompt, claims_list, doc_outlines,
-                )
                 try:
                     print(f"[DEBUG] Using generate_slide_spec path (fresh generation)")
                     spec = generate_slide_spec(
-                        prompt, filtered_claims, brand_guidelines,
+                        prompt, claims_list, brand_guidelines,
                         target_audience, audience_rules, slim_history,
                         component_patterns=component_patterns,
                         doc_outline=combined_outline,
@@ -798,16 +810,11 @@ def send_message_stream(session_id):
                 elif 'generate' in ops:
                     eq.put(('status', {'step': 'Planning narrative...'}))
 
-                    # Filter claims by embedding similarity
-                    filtered_claims = _filter_claims_by_embedding(
-                        prompt, claims_list, stream_doc_outlines,
-                    )
-
                     def _on_slide_ready(idx, slide):
                         eq.put(('slide_ready', {'index': idx, 'layout': slide.get('layout', ''), 'title': slide.get('slide_title', '')}))
 
                     spec = generate_slide_spec(
-                        prompt, filtered_claims, brand_guidelines,
+                        prompt, claims_list, brand_guidelines,
                         target_audience, audience_rules, slim_history,
                         component_patterns=component_patterns,
                         on_slide_ready=_on_slide_ready,
