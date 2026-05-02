@@ -1886,151 +1886,32 @@ def _plan_narrative(prompt, claims, brand_guidelines, target_audience, audience_
     raise ValueError("Narrative planner did not return a plan")
 
 
-def _prefilter_claims(claims, slide_plan):
-    """Step 1a: Programmatic pre-filter — narrow claims by type, keyword overlap, and embedding similarity.
-    Also expands to include neighboring claims (±2 on same page) for context."""
-    target_types = set(t.lower() for t in slide_plan.get('claim_types', []))
-    # Expand compound keywords: "overall_survival" → {"overall_survival", "overall", "survival"}
-    keywords = set()
-    for k in slide_plan.get('keywords', []):
-        kl = k.lower()
-        keywords.add(kl)
-        if '_' in kl:
-            keywords.update(kl.split('_'))
-    target_section = (slide_plan.get('section') or '').lower().strip()
+def _retrieve_claims(claims, slide_topic, top_k=10):
+    """Retrieve top-K claims by cosine similarity to slide topic.
+    Pure embedding search — no keyword scoring, no section gates, no heuristics."""
+    from services.embedding_service import embed_texts, cosine_similarity
 
-    # Embedding-based scoring: embed the slide topic and boost claims with high similarity
-    emb_scores = {}  # claim_id → similarity score
-    claims_with_emb = [c for c in claims if c.get('embedding')]
-    if claims_with_emb:
-        try:
-            from services.embedding_service import embed_texts, cosine_similarity
-            topic_text = slide_plan.get('topic', '')
-            if keywords:
-                topic_text += ' ' + ' '.join(keywords)
-            topic_emb = embed_texts([topic_text])[0]
-            for c in claims_with_emb:
-                sim = cosine_similarity(topic_emb, c['embedding'])
-                if sim > 0.25:
-                    emb_scores[c['id']] = sim
-            if emb_scores:
-                print(f"[PREFILTER-EMB] {len(emb_scores)} claims above 0.25 similarity for '{slide_plan.get('topic', '')[:60]}'")
-        except Exception as e:
-            print(f"[PREFILTER-EMB] Embedding scoring failed: {e}")
+    topic_emb = embed_texts([slide_topic])[0]
 
-    content_scored = []
-    isi_claims = []
+    scored = []
     for c in claims:
-        ctype = (c.get('claim_type') or '').lower()
-        # Normalize tags: split multi-word tags into individual tokens too
-        raw_tags = set(t.lower() for t in (c.get('tags') or []))
-        tags = set(raw_tags)
-        for t in raw_tags:
-            tags.update(t.split())
-        content_format = c.get('content_format', 'text')
-
-        # Collect ISI/boilerplate separately (capped later, not competing for content slots)
-        if ctype in ('isi', 'boilerplate'):
-            isi_claims.append(c)
+        if not c.get('embedding'):
             continue
+        sim = cosine_similarity(topic_emb, c['embedding'])
+        scored.append((sim, c))
 
-        # Visual claims (tables/figures) get boosted scoring — they're high-value
-        # and their short captions shouldn't penalize them
-        is_visual = content_format in ('table', 'figure')
+    scored.sort(key=lambda x: x[0], reverse=True)
+    top = [c for _, c in scored[:top_k]]
 
-        # Must match at least one target type (if types specified)
-        # Visual claims bypass the type filter since they're always 'stat'
-        if target_types and ctype not in target_types and not is_visual:
-            continue
-
-        # Score by keyword overlap with tags + text keywords
-        text_tokens = set(re.sub(r'[^a-z0-9\s]', '', (c.get('text') or '').lower()).split())
-        tag_overlap = len(keywords & tags)
-        text_overlap = len(keywords & text_tokens)
-        score = tag_overlap * 3 + text_overlap  # tags weighted higher
-
-        # Section gate: when a target section is specified, hard-skip claims
-        # that don't belong to that section (prevents cross-section bleed)
-        claim_sections = [s.lower() for s in (c.get('section_hierarchy') or [])]
-        if not claim_sections:
-            # Fallback to flat section for backward compat
-            flat = (c.get('section') or '').lower().strip()
-            if flat:
-                claim_sections = [flat]
-        if target_section:
-            in_section = any(target_section in s for s in claim_sections)
-            if not in_section:
-                continue  # hard gate: wrong section, skip entirely
-            score += 10
-
-        # Match topic words against claim text (critical for tables with enriched captions)
-        topic_words = set(re.sub(r'[^a-z0-9\s]', '', (slide_plan.get('topic') or '').lower()).split())
-        topic_words -= {'the', 'and', 'for', 'from', 'with', 'that', 'this', 'show', 'add', 'table', 'slide', 'create'}
-        claim_text_words = set(re.sub(r'[^a-z0-9\s]', '', (c.get('text') or '').lower()).split())
-        topic_text_match = len(topic_words & claim_text_words)
-        if is_visual and topic_text_match >= 2:
-            score += 15  # strong match between topic and table caption/context
-
-        # Boost visual claims — any keyword match in their caption is highly relevant
-        if is_visual and (text_overlap > 0 or tag_overlap > 0):
-            score += 8
-        # Visual claims in matching section always included even with zero keyword overlap
-        elif is_visual and target_section and any(target_section in s for s in claim_sections):
-            score += 5
-
-        # Boost if the slide topic explicitly mentions this table/figure by number
-        # e.g., topic "Overall Survival (Table 7, Figure 2)" → match "Table 7" in caption
-        if is_visual:
-            claim_text_lower = (c.get('text') or '').lower()
-            topic_lower = (slide_plan.get('topic') or '').lower()
-            # Match "table N" or "figure N" in both topic and caption
-            for ref in re.findall(r'(?:table|figure)\s*\d+', topic_lower):
-                if ref in claim_text_lower:
-                    score += 20  # strong signal — user/planner explicitly named this visual
-                    break
-
-        # Embedding similarity boost (scaled to 0-12 points for sims 0.25-0.7+)
-        emb_sim = emb_scores.get(c.get('id'), 0)
-        if emb_sim > 0:
-            score += int(emb_sim * 20)  # e.g. 0.5 sim → +10 points
-
-        if score > 0 or not keywords:
-            content_scored.append((c, score))
-
-    # Take top 17 content claims + up to 3 ISI/boilerplate
-    content_scored.sort(key=lambda x: x[1], reverse=True)
-    top_claims = [c for c, _ in content_scored[:17]]
-
-    # Expand to include ±2 neighboring claims on same page — only for visual claims
-    top_ids = {c['id'] for c in top_claims}
-    sorted_claims = sorted(
-        [c for c in claims if (c.get('claim_type') or '').lower() not in ('isi', 'boilerplate')],
-        key=lambda c: (c.get('page_number') or 0, c.get('created_at', '')),
-    )
-    expanded_ids = set(top_ids)
-    for i, c in enumerate(sorted_claims):
-        if c['id'] in top_ids and c.get('content_format', 'text') in ('table', 'figure'):
-            page = c.get('page_number')
-            for offset in (-2, -1, 1, 2):
-                ni = i + offset
-                if 0 <= ni < len(sorted_claims):
-                    neighbor = sorted_claims[ni]
-                    if neighbor.get('page_number') == page:
-                        expanded_ids.add(neighbor['id'])
-
-    neighbor_claims = [c for c in sorted_claims if c['id'] in expanded_ids and c['id'] not in top_ids]
-    result = top_claims + neighbor_claims + isi_claims[:3]
-
-    # Debug: log top candidates with scores
-    for c, s in content_scored[:17]:
+    # Debug log
+    for sim, c in scored[:top_k]:
         fmt = c.get('content_format', 'text')
         label = f" [{fmt}]" if fmt != 'text' else ''
-        print(f"[DEBUG] Prefilter candidate (score={s}): {c.get('id', '?')}{label} — {c.get('text', '')[:80]}")
-    if neighbor_claims:
-        print(f"[DEBUG] Prefilter: +{len(neighbor_claims)} neighbor claims from same pages")
-    if isi_claims:
-        print(f"[DEBUG] Prefilter: {len(isi_claims)} ISI/boilerplate claims, including top {min(3, len(isi_claims))}")
-    return result
+        section = c.get('section', '?')
+        print(f"[RETRIEVE] sim={sim:.3f} {c.get('id', '?')}{label} [{section}] — {c.get('text', '')[:80]}")
+    print(f"[RETRIEVE] Returned top {len(top)} claims for '{slide_topic[:60]}'")
+
+    return top
 
 
 def _select_claims(slide_topic, candidate_claims):
@@ -2401,51 +2282,12 @@ def generate_slide_spec(
         topic = slide_plan['topic']
         print(f"[DEBUG] Processing slide {idx}: {topic}")
 
-        # Pinned visuals for THIS slide only
-        slide_pinned = pinned_assignment.get(idx, [])
+        # Step 1: Retrieve top-K claims by cosine similarity
+        candidates = _retrieve_claims(claims, topic, top_k=10)
+        print(f"[DEBUG] Retrieved {len(candidates)} candidates for '{topic}'")
 
-        # Step 1a: Programmatic pre-filter
-        candidates = _prefilter_claims(claims, slide_plan)
-
-        # Ensure this slide's pinned visuals are in candidates (section-gated)
-        candidate_ids = {c['id'] for c in candidates}
-        slide_section = (slide_plan.get('section') or '').lower().strip()
-        for pv in slide_pinned:
-            if pv['id'] not in candidate_ids:
-                # Section gate: skip pinned visuals from wrong sections
-                if slide_section:
-                    pv_sections = [s.lower() for s in (pv.get('section_hierarchy') or [])]
-                    if not pv_sections:
-                        flat = (pv.get('section') or '').lower().strip()
-                        if flat:
-                            pv_sections = [flat]
-                    if pv_sections and not any(slide_section in s for s in pv_sections):
-                        print(f"[DEBUG] Skipped pinned visual {pv['id']} — section mismatch (slide={slide_section}, claim={pv_sections})")
-                        continue
-                candidates.append(pv)
-                print(f"[DEBUG] Injected pinned visual into candidates: {pv['id']}")
-
-        print(f"[DEBUG] Pre-filtered {len(candidates)} candidates for '{topic}'")
-
-        # Step 1b: LLM strict selection
+        # Step 2: LLM strict selection from candidates
         selected = _select_claims(topic, candidates)
-
-        # Ensure this slide's pinned visuals are in the selection (section-gated)
-        selected_ids = {s['claim_id'] for s in selected}
-        for pv in slide_pinned:
-            if pv['id'] not in selected_ids:
-                # Section gate: skip pinned visuals from wrong sections
-                if slide_section:
-                    pv_sections = [s.lower() for s in (pv.get('section_hierarchy') or [])]
-                    if not pv_sections:
-                        flat = (pv.get('section') or '').lower().strip()
-                        if flat:
-                            pv_sections = [flat]
-                    if pv_sections and not any(slide_section in s for s in pv_sections):
-                        print(f"[DEBUG] Skipped force-add of pinned visual {pv['id']} — section mismatch")
-                        continue
-                selected.append({'claim_id': pv['id'], 'role': 'supporting'})
-                print(f"[DEBUG] Force-added pinned visual to selection: {pv['id']}")
 
         # Steps 2+3+4: Build slide
         slide = _build_slide(topic, selected, claims,
