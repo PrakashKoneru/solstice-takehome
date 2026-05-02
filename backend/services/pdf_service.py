@@ -812,12 +812,29 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
 
     # Step 2: Collect all content items from iterate_items()
     all_items = []
+    last_caption = None  # track captions for figure labeling
+    body_started = False  # track TOC boundary
     for item, _level in doc_result.document.iterate_items():
         if isinstance(item, SectionHeaderItem):
+            # Detect body start: first numbered section heading (e.g. "1 INDICATIONS AND USAGE")
+            if not body_started and hasattr(item, 'text') and item.text:
+                heading_text = item.text.strip()
+                if _re.match(r'^\d+\.?\s+\S', heading_text):
+                    body_started = True
+                    print(f"[DOCLING-KB] Body starts at: '{heading_text}' (page {item.prov[0].page_no if item.prov else '?'})")
             continue  # headers are structural, not claims
+
+        # Skip everything before the body (highlights, TOC)
+        if not body_started:
+            continue
+
         label = item.label.value if hasattr(item.label, 'value') else str(item.label)
         page_no = item.prov[0].page_no if item.prov else 0
         self_ref = item.self_ref if hasattr(item, 'self_ref') else None
+
+        # Track captions for figure labeling
+        if label == 'caption':
+            last_caption = item.text.strip() if hasattr(item, 'text') and item.text else None
 
         if isinstance(item, TableItem):
             try:
@@ -835,8 +852,20 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
             except Exception:
                 pass
         elif isinstance(item, PictureItem):
-            # Pictures handled separately (figures list above)
-            continue
+            caption = last_caption or current_section or f'Figure (page {page_no})'
+            fig_url = None
+            for fig in figures:
+                if fig.get('page_number') == page_no:
+                    fig_url = fig.get('figure_url')
+                    break
+            all_items.append({
+                'self_ref': self_ref,
+                'label': 'picture',
+                'text': caption,
+                'content_format': 'figure',
+                'figure_url': fig_url,
+                'page_number': page_no,
+            })
         else:
             text = item.text if hasattr(item, 'text') and item.text else None
             if text and text.strip():
@@ -848,76 +877,164 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
                     'page_number': page_no,
                 })
 
-    print(f"[DOCLING-KB] Collected {len(all_items)} content items from iterate_items()")
+    print(f"[DOCLING-KB] Collected {len(all_items)} content items (body only, after TOC)")
 
-    # Step 3: LLM filter — Haiku identifies real content vs junk
-    kept_items = all_items  # fallback: keep all if LLM fails
+    # Step 3a: Deterministic junk filter — regex-based, no LLM
+    filtered_items = []
+    removed_deterministic = []
+    for idx, item in enumerate(all_items):
+        text = item.get('text', '')
+        is_junk = False
+
+        # Always keep tables and figures
+        if item['content_format'] in ('table', 'figure'):
+            filtered_items.append(item)
+            continue
+
+        # TOC lines with dots
+        if _re.search(r'\.{3,}', text):
+            is_junk = True
+        # Very short fragments with no numbers (orphans like "Capsules:", "None.", "Placebo")
+        elif len(text) < 15 and not _re.search(r'\d', text):
+            is_junk = True
+        # Chart axis labels: just a number with optional dash/dot
+        elif _re.match(r'^[\d\.\-\+\}\s]+$', text) and len(text) < 10:
+            is_junk = True
+        # Page header/footer patterns
+        elif _re.match(r'^Reference ID:', text, _re.IGNORECASE):
+            is_junk = True
+        # Bare section ref without content: "Dosage and Administration (2.2)" and nothing else
+        elif _re.match(r'^[\w\s,]+\(\d+[\.\d]*\)\s*$', text) and len(text) < 60:
+            is_junk = True
+
+        if is_junk:
+            removed_deterministic.append((idx, item))
+        else:
+            filtered_items.append(item)
+
+    print(f"[DOCLING-KB] Deterministic filter: {len(all_items)} → {len(filtered_items)} "
+          f"(removed {len(removed_deterministic)} junk items)")
+
+    # Step 3b: LLM split — Haiku splits multi-fact items into atomic claims
+    kept_items = filtered_items  # fallback: keep as-is if LLM fails
     try:
         import anthropic
         import json as _json
-        filter_client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+        split_client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
 
-        # Build compact item list for the LLM
+        # Build compact item list for the LLM — only text items need splitting
         item_list = []
-        for idx, item in enumerate(all_items):
-            if item['content_format'] == 'table':
-                item_list.append({'i': idx, 'label': item['label'], 'text': '[TABLE]', 'page': item['page_number']})
+        for idx, item in enumerate(filtered_items):
+            if item['content_format'] in ('table', 'figure'):
+                item_list.append({'i': idx, 'label': item['label'], 'text': '[KEEP WHOLE]', 'page': item['page_number']})
             else:
-                item_list.append({'i': idx, 'label': item['label'], 'text': item['text'][:150], 'page': item['page_number']})
+                item_list.append({'i': idx, 'label': item['label'], 'text': item['text'], 'page': item['page_number']})
 
-        filter_tool = {
-            "name": "filter_items",
-            "description": "Return indices of items that are real document content worth keeping as claims.",
+        split_tool = {
+            "name": "split_claims",
+            "description": "Split multi-fact text items into atomic claims using character positions.",
             "input_schema": {
                 "type": "object",
                 "properties": {
-                    "keep_indices": {
+                    "claims": {
                         "type": "array",
-                        "items": {"type": "integer"},
-                        "description": "Indices of items to keep"
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "source_index": {
+                                    "type": "integer",
+                                    "description": "Index of the source item in the input list"
+                                },
+                                "start": {
+                                    "type": "integer",
+                                    "description": "Start character position (0-based). Use 0 for items kept whole."
+                                },
+                                "end": {
+                                    "type": "integer",
+                                    "description": "End character position (exclusive). Use -1 for items kept whole or to mean end of text."
+                                }
+                            },
+                            "required": ["source_index", "start", "end"]
+                        }
                     }
                 },
-                "required": ["keep_indices"]
+                "required": ["claims"]
             }
         }
 
-        filter_response = filter_client.messages.create(
-            model='claude-haiku-4-5-20251001',
-            max_tokens=4096,
+        split_response = split_client.messages.create(
+            model='claude-sonnet-4-6',
+            max_tokens=16384,
             system=(
-                "You are a pharma document analyst. You receive a list of text elements extracted from a pharmaceutical document. "
-                "Return the indices of items that are REAL CONTENT — factual claims, safety statements, efficacy data, "
-                "dosing instructions, study results, adverse reactions, warnings, ISI statements, footnotes with data.\n\n"
-                "EXCLUDE:\n"
-                "- Table of contents lines (contain '...' dots or just section refs with page numbers)\n"
-                "- Page headers/footers that repeat across pages\n"
-                "- Orphan fragments (single words, partial labels like 'Capsules:', 'None.', 'Placebo')\n"
-                "- Bare section references without content (e.g. 'Dosage and Administration (2.2)')\n"
-                "- Chart axis labels or tick marks (e.g. '0.6 -', '0.4 -')\n"
-                "- Copyright/trademark boilerplate\n\n"
-                "ALWAYS KEEP:\n"
-                "- Tables ([TABLE] items) — always keep these\n"
-                "- Any item with clinical data, percentages, or drug information\n"
-                "- Safety warnings and precaution statements\n"
-                "- Footnotes with statistical methodology"
+                "You are a pharma document analyst. You receive pre-filtered text elements from a pharmaceutical document. "
+                "ALL items are real content — do NOT remove any. Your ONLY job is to split items into atomic claims.\n\n"
+                "PROCESS:\n"
+                "1. Read and understand each item's content fully\n"
+                "2. Identify distinct facts, data points, or statements within the item\n"
+                "3. Return character positions to split at natural fact boundaries\n\n"
+                "For each item, return {source_index, start, end}:\n"
+                "- Items marked [KEEP WHOLE]: always return start=0, end=-1\n"
+                "- Items with 1-3 sentences that form one fact: return start=0, end=-1 (keep whole)\n"
+                "- Items with multiple facts: return multiple entries with character positions\n\n"
+                "SPLITTING RULES:\n"
+                "- Each resulting claim must be MAX 3 sentences. A claim can be 1, 2, or 3 sentences.\n"
+                "- Split at natural fact boundaries — where the topic or data point changes\n"
+                "- Do NOT split mechanically every 3 sentences. Understand the content first, then decide where facts naturally separate.\n"
+                "- Each split must align to real sentence boundaries in the source text\n"
+                "- A claim should be a self-contained piece of information\n\n"
+                "EXAMPLES:\n"
+                "- 'OS was 7.4 months (95% CI: 6.7, 8.2). PFS was 2.7 months (95% CI: 1.5, 3.7).' → two claims (different endpoints)\n"
+                "- A paragraph describing study design (enrollment, eligibility, stratification) → split by: design, eligibility, stratification\n"
+                "- 'FRUZAQLA can cause serious hemorrhagic events, which may be fatal.' → one claim (keep whole, cohesive warning)\n\n"
+                "IMPORTANT: Return EVERY item. Do not skip any. Every source_index must appear at least once."
             ),
-            tools=[filter_tool],
-            tool_choice={"type": "tool", "name": "filter_items"},
-            messages=[{'role': 'user', 'content': f"Filter these document items:\n{_json.dumps(item_list)}"}],
+            tools=[split_tool],
+            tool_choice={"type": "tool", "name": "split_claims"},
+            messages=[{'role': 'user', 'content': f"Split these items into atomic claims:\n{_json.dumps(item_list)}"}],
         )
 
-        for block in filter_response.content:
-            if block.type == 'tool_use' and block.name == 'filter_items':
-                keep_indices = set(block.input.get('keep_indices', []))
-                kept_items = [all_items[idx] for idx in sorted(keep_indices) if idx < len(all_items)]
-                print(f"[DOCLING-KB] LLM filter: {len(all_items)} → {len(kept_items)} items "
-                      f"(removed {len(all_items) - len(kept_items)} junk items)")
+        for block in split_response.content:
+            if block.type == 'tool_use' and block.name == 'split_claims':
+                raw_claims = block.input.get('claims', [])
+                kept_items = []
+                for rc in raw_claims:
+                    src_idx = rc.get('source_index', 0)
+                    if src_idx >= len(filtered_items):
+                        continue
+                    src = filtered_items[src_idx]
+                    start = rc.get('start', 0)
+                    end = rc.get('end', -1)
+
+                    new_item = dict(src)
+                    new_item['_source_index'] = src_idx
+
+                    if src['content_format'] == 'text' and not (start == 0 and end == -1):
+                        full_text = src['text']
+                        if end == -1:
+                            end = len(full_text)
+                        sliced = full_text[start:end].strip()
+                        if sliced:
+                            new_item['text'] = sliced
+                        else:
+                            continue
+                    kept_items.append(new_item)
+
+                from collections import Counter
+                idx_counts = Counter(rc['source_index'] for rc in raw_claims)
+                split_count = sum(1 for v in idx_counts.values() if v > 1)
+                print(f"[DOCLING-KB] LLM split: {len(filtered_items)} items → {len(kept_items)} claims "
+                      f"({split_count} items were split)")
                 break
     except Exception as e:
-        print(f"[DOCLING-KB] LLM filter failed (keeping all items): {e}")
+        print(f"[DOCLING-KB] LLM split failed (keeping filtered items as-is): {e}")
+        import traceback
+        traceback.print_exc()
 
     # Step 4: Chunk with HierarchicalChunker for section grouping
     chunks_data = []
+    ref_to_chunk = {}
+    chunk_meta = []
+    orphan_items = []
     try:
         from docling.chunking import HierarchicalChunker
         chunker = HierarchicalChunker(merge_list_items=True)
@@ -1018,6 +1135,16 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
         "figures": figures,
         "chunks": chunks_data,
         "total_pages": total_pages if isinstance(total_pages, int) else len(pages),
+        # Debug intermediates
+        "_debug": {
+            "all_items": all_items,
+            "filtered_items": filtered_items,
+            "removed_deterministic": removed_deterministic,
+            "kept_items": kept_items,
+            "chunk_meta": chunk_meta,
+            "ref_to_chunk": ref_to_chunk,
+            "orphan_items": orphan_items,
+        },
     }
 
 

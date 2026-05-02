@@ -61,6 +61,9 @@ class KnowledgeItem(db.Model):
     created_at         = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at         = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    chunks = db.relationship('Chunk', backref='knowledge_item', lazy=True, cascade='all, delete-orphan')
+    claims = db.relationship('Claim', backref='knowledge_item', lazy=True, cascade='all, delete-orphan')
+
     def to_dict(self):
         return {
             'id':                self.id,
