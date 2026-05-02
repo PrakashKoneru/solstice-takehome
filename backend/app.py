@@ -42,11 +42,13 @@ def create_app():
     from routes.design_system import design_system_bp
     from routes.knowledge import knowledge_bp
     from routes.chat import chat_bp
+    from routes.knowledge_base import kb_debug_bp
     import routes.presence  # noqa: F401 — registers Socket.IO event handlers
     app.register_blueprint(sessions_bp)
     app.register_blueprint(design_system_bp)
     app.register_blueprint(knowledge_bp)
     app.register_blueprint(chat_bp)
+    app.register_blueprint(kb_debug_bp)
 
     @app.route('/api/health')
     def health():

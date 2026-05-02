@@ -7,9 +7,9 @@ import threading
 from flask import Blueprint, jsonify, request, current_app, Response
 from werkzeug.utils import secure_filename
 from extensions import db
-from models import KnowledgeItem, Claim
+from models import KnowledgeItem, Claim, Chunk
 from services.pdf_service import extract_text_from_pdf, extract_text_by_page, parse_document_docling
-from services.claim_extractor import extract_claims_streaming, assign_sections_to_claims, _is_verbatim
+from services.claim_extractor import extract_claims_streaming, assign_sections_to_claims, _is_verbatim, extract_claims_from_chunks
 
 logger = logging.getLogger(__name__)
 
@@ -33,183 +33,109 @@ def list_knowledge():
     return jsonify(result)
 
 
-def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=None, pages_text_only=None):
-    """Background thread: extract claims page-by-page and write to DB,
-    then create table and figure claims from Docling output."""
+def _run_extraction(app, item_id, pages, docling_tables=None, docling_figures=None,
+                    pages_text_only=None, chunks_data=None):
+    """Background thread: create chunks, extract claims deterministically, embed both."""
     with app.app_context():
         try:
             item = db.session.get(KnowledgeItem, item_id)
             item.extraction_status = 'extracting'
             db.session.commit()
 
-            # Get doc_outline for section assignment
-            doc_outline = item.doc_outline or []
+            if not chunks_data:
+                raise ValueError("No chunks produced from document — chunking pipeline required")
 
-            def on_page_done(page_num, page_claims):
-                """Insert each page's claims into DB as they arrive."""
-                # Assign sections before writing to DB
-                if doc_outline:
-                    assign_sections_to_claims(page_claims, doc_outline)
-                with app.app_context():
-                    for seq_offset, c in enumerate(page_claims):
-                        # Generate unique ID using page_num to avoid collisions
-                        from services.claim_extractor import _make_id
-                        claim_id = _make_id(c['text'], c['claim_type'], page_num * 1000 + seq_offset)
-                        existing = db.session.get(Claim, claim_id)
-                        if not existing:
-                            db.session.add(Claim(
-                                id=claim_id,
-                                knowledge_id=item_id,
-                                text=c['text'],
-                                claim_type=c['claim_type'],
-                                source_citation=c.get('source_citation'),
-                                page_number=c.get('page_number'),
-                                numeric_values=c.get('numeric_values', []),
-                                tags=c.get('tags', []),
-                                section=c.get('section'),
-                                section_hierarchy=c.get('section_hierarchy'),
-                                is_approved=True,
-                            ))
-                    db.session.commit()
-                    logger.info("Page %d: wrote %d claims to DB for item %d", page_num, len(page_claims), item_id)
+            # ── Chunk-based pipeline ──────────────────────────────
+            logger.info("Using chunk-based extraction for item %d (%d chunks)", item_id, len(chunks_data))
 
-            claims_data = extract_claims_streaming(pages, item_id, app, on_page_done=on_page_done, verbatim_pages=pages_text_only)
+            # Step 1: Create chunk rows
+            for cd in chunks_data:
+                existing = db.session.get(Chunk, cd['id'])
+                if not existing:
+                    db.session.add(Chunk(
+                        id=cd['id'],
+                        knowledge_id=item_id,
+                        headings=cd.get('headings'),
+                        serialized_text=cd.get('serialized_text'),
+                        element_types=cd.get('element_types'),
+                        has_table=cd.get('has_table', False),
+                        has_figure=cd.get('has_figure', False),
+                        page_start=cd.get('page_start'),
+                        page_end=cd.get('page_end'),
+                    ))
+            db.session.commit()
+            logger.info("Created %d chunks for item %d", len(chunks_data), item_id)
 
-            # Create table claims from Docling output
-            if docling_tables:
-                from services.claim_extractor import _make_id
-                # Build claim dicts first so we can assign sections before DB insert
-                table_claim_dicts = []
-                for t_idx, tbl in enumerate(docling_tables):
-                    caption = tbl['caption']
-                    context = tbl.get('context', '')
-                    if re.match(r'^(##\s*)?Table\s+\d+\s*$', caption, re.IGNORECASE) and context:
-                        claim_text = context
-                    else:
-                        claim_text = caption
+            # Step 2: Extract claims from chunks (deterministic, no LLM)
+            claim_dicts = extract_claims_from_chunks(chunks_data, item_id)
 
-                    stop_words = {'table', 'the', 'and', 'for', 'from', 'with', 'that', 'this', 'were', 'was', 'are', 'have', 'been'}
-                    tags = ['table']
-                    caption_words = re.sub(r'[^a-z\s]', '', caption.lower()).split()
-                    tags.extend([w for w in caption_words if len(w) > 3 and w not in stop_words])
-                    if context:
-                        context_words = re.sub(r'[^a-z\s]', '', context.lower()).split()
-                        tags.extend([w for w in context_words if len(w) > 3 and w not in stop_words])
-                    if tbl.get('table_json') and tbl['table_json'].get('headers'):
-                        for h in tbl['table_json']['headers']:
-                            header_words = re.sub(r'[^a-z\s]', '', h.lower()).split()
-                            tags.extend([w for w in header_words if len(w) > 3 and w not in stop_words])
-                    tags = list(set(tags))
+            # Step 3: Insert claims into DB
+            for cd in claim_dicts:
+                existing = db.session.get(Claim, cd['id'])
+                if not existing:
+                    db.session.add(Claim(
+                        id=cd['id'],
+                        chunk_id=cd.get('chunk_id'),
+                        knowledge_id=item_id,
+                        text=cd['text'],
+                        claim_type=cd['claim_type'],
+                        content_format=cd.get('content_format', 'text'),
+                        table_markdown=cd.get('table_markdown'),
+                        table_json=cd.get('table_json'),
+                        figure_url=cd.get('figure_url'),
+                        page_number=cd.get('page_number'),
+                        numeric_values=cd.get('numeric_values', []),
+                        tags=cd.get('tags', []),
+                        section=cd.get('section'),
+                        section_hierarchy=cd.get('section_hierarchy'),
+                        is_approved=True,
+                    ))
+            db.session.commit()
+            logger.info("Created %d claims from chunks for item %d", len(claim_dicts), item_id)
 
-                    table_claim_dicts.append({
-                        'claim_id': _make_id(claim_text, 'stat', 90000 + t_idx),
-                        'text': claim_text,
-                        'claim_type': 'stat',
-                        'page_number': tbl['page_number'],
-                        'tags': tags,
-                        'markdown': tbl['markdown'],
-                        'table_json': tbl.get('table_json'),
-                        'figure_url': tbl.get('figure_url'),
-                    })
-
-                # Assign hierarchical sections before creating DB objects
-                if doc_outline:
-                    assign_sections_to_claims(table_claim_dicts, doc_outline)
-
-                for td in table_claim_dicts:
-                    existing = db.session.get(Claim, td['claim_id'])
-                    if not existing:
-                        db.session.add(Claim(
-                            id=td['claim_id'],
-                            knowledge_id=item_id,
-                            text=td['text'],
-                            claim_type='stat',
-                            content_format='table',
-                            table_markdown=td['markdown'],
-                            table_json=td.get('table_json'),
-                            figure_url=td.get('figure_url'),
-                            page_number=td['page_number'],
-                            section=td.get('section'),
-                            section_hierarchy=td.get('section_hierarchy'),
-                            tags=td['tags'],
-                            is_approved=True,
-                        ))
-                db.session.commit()
-                logger.info("Created %d table claims for item %d", len(docling_tables), item_id)
-
-            # Create figure claims from Docling output
-            if docling_figures:
-                from services.claim_extractor import _make_id
-                figure_claim_dicts = []
-                for f_idx, fig in enumerate(docling_figures):
-                    caption = fig.get('caption') or f"Figure {f_idx + 1}"
-                    figure_claim_dicts.append({
-                        'claim_id': _make_id(caption, 'stat', 80000 + f_idx),
-                        'text': caption,
-                        'claim_type': 'stat',
-                        'page_number': fig['page_number'],
-                        'figure_url': fig.get('figure_url', ''),
-                    })
-
-                # Assign hierarchical sections before creating DB objects
-                if doc_outline:
-                    assign_sections_to_claims(figure_claim_dicts, doc_outline)
-
-                for fd in figure_claim_dicts:
-                    existing = db.session.get(Claim, fd['claim_id'])
-                    if not existing:
-                        db.session.add(Claim(
-                            id=fd['claim_id'],
-                            knowledge_id=item_id,
-                            text=fd['text'],
-                            claim_type='stat',
-                            content_format='figure',
-                            figure_url=fd['figure_url'],
-                            page_number=fd['page_number'],
-                            section=fd.get('section'),
-                            section_hierarchy=fd.get('section_hierarchy'),
-                            tags=['figure'],
-                            is_approved=True,
-                        ))
-                db.session.commit()
-                logger.info("Created %d figure claims for item %d", len(docling_figures), item_id)
-
-            # Embed all claims for semantic search (with section context for better retrieval)
+            # Step 4: Embed chunks (serialized_text) and claims (section + text)
             try:
                 from services.embedding_service import embed_texts
-                all_claims = Claim.query.filter_by(knowledge_id=item_id).order_by(Claim.page_number, Claim.created_at).all()
-                # Build contextual text: section hierarchy + claim text + neighbor preview
+
+                # Embed chunks
+                all_chunks = Chunk.query.filter_by(knowledge_id=item_id).all()
+                chunk_texts = [c.serialized_text or '' for c in all_chunks]
+                if chunk_texts:
+                    chunk_embeddings = embed_texts(chunk_texts)
+                    for chunk_obj, emb in zip(all_chunks, chunk_embeddings):
+                        chunk_obj.embedding = emb
+                    db.session.commit()
+                    logger.info("Embedded %d chunks for item %d", len(chunk_texts), item_id)
+
+                # Embed claims (section hierarchy + claim text)
+                all_claims = Claim.query.filter_by(knowledge_id=item_id).order_by(Claim.page_number).all()
                 claim_embed_texts = []
-                for i, c in enumerate(all_claims):
+                for c in all_claims:
                     parts = []
                     if c.section_hierarchy:
                         parts.append(' > '.join(c.section_hierarchy))
-                    elif c.section:
-                        parts.append(c.section)
                     parts.append(c.text)
-                    # Add neighbor claim text for context (±1 on same page)
-                    for neighbor_idx in (i - 1, i + 1):
-                        if 0 <= neighbor_idx < len(all_claims):
-                            neighbor = all_claims[neighbor_idx]
-                            if neighbor.page_number == c.page_number:
-                                parts.append(neighbor.text)
                     claim_embed_texts.append(' | '.join(parts))
                 if claim_embed_texts:
-                    embeddings = embed_texts(claim_embed_texts)
-                    for claim_obj, emb in zip(all_claims, embeddings):
+                    claim_embeddings = embed_texts(claim_embed_texts)
+                    for claim_obj, emb in zip(all_claims, claim_embeddings):
                         claim_obj.embedding = emb
                     db.session.commit()
-                    logger.info("Embedded %d claims (with context) for item %d", len(claim_embed_texts), item_id)
+                    logger.info("Embedded %d claims for item %d", len(claim_embed_texts), item_id)
             except Exception as e:
-                logger.warning("Claim embedding failed (non-fatal) for item %d: %s", item_id, e)
+                logger.warning("Embedding failed (non-fatal) for item %d: %s", item_id, e)
 
             item = db.session.get(KnowledgeItem, item_id)
             item.extraction_status = 'complete'
             db.session.commit()
-            logger.info("Extraction complete for item %d: %d total claims", item_id,
+            logger.info("Extraction complete for item %d: %d chunks, %d claims",
+                        item_id,
+                        Chunk.query.filter_by(knowledge_id=item_id).count(),
                         Claim.query.filter_by(knowledge_id=item_id).count())
         except Exception as e:
             logger.error("Extraction failed for item %d: %s", item_id, e)
+            import traceback
+            traceback.print_exc()
             try:
                 item = db.session.get(KnowledgeItem, item_id)
                 if item:
@@ -258,8 +184,9 @@ def upload_knowledge():
     db.session.add(item)
     db.session.commit()
 
-    # Kick off background extraction with Docling tables/figures
+    # Kick off background extraction with chunks (new pipeline)
     app = current_app._get_current_object()
+    chunks_data = docling_result.get("chunks", [])
     t = threading.Thread(
         target=_run_extraction,
         args=(app, item.id, pages),
@@ -267,6 +194,7 @@ def upload_knowledge():
             'docling_tables': docling_result["tables"],
             'docling_figures': docling_result["figures"],
             'pages_text_only': docling_result.get("pages_text_only"),
+            'chunks_data': chunks_data if chunks_data else None,
         },
         daemon=True,
     )

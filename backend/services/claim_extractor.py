@@ -358,3 +358,157 @@ def extract_claims(text: str, knowledge_id: int) -> list:
         pages.append({"page_number": (i // CHUNK_SIZE) + 1, "text": text[i:i + CHUNK_SIZE]})
 
     return extract_claims_streaming(pages, knowledge_id, app=None)
+
+
+# ── Deterministic claim extraction from chunks (no LLM) ────────────────────
+
+# Regex patterns for numeric value extraction
+_NUMERIC_PATTERNS = [
+    # "6%" or "49.4%"
+    (r'(\d+\.?\d*)\s*%', lambda m: {'value': m.group(1) + '%', 'unit': '', 'label': ''}),
+    # "7.4 months" or "14 days"
+    (r'(\d+\.?\d*)\s*(months?|days?|weeks?|years?)', lambda m: {'value': m.group(1), 'unit': m.group(2), 'label': ''}),
+    # "HR 0.66" or "HR=0.66"
+    (r'HR\s*[=:]?\s*(\d+\.?\d*)', lambda m: {'value': m.group(1), 'unit': '', 'label': 'HR'}),
+    # "CI 0.50-0.85" or "95% CI: 0.50, 0.85"
+    (r'CI\s*[:\s]*(\d+\.?\d*)\s*[-–,]\s*(\d+\.?\d*)', lambda m: {'value': f'{m.group(1)}-{m.group(2)}', 'unit': '', 'label': 'CI'}),
+    # "p<0.001" or "p=0.003"
+    (r'p\s*[<>=]\s*(\d+\.?\d*)', lambda m: {'value': f'p{m.group(0).split("p")[1].strip()}', 'unit': '', 'label': 'p-value'}),
+    # "N of N (N%)" pattern like "13 of 911 (1%)"
+    (r'(\d+)\s+of\s+(\d+)\s*\((\d+\.?\d*)%\)', lambda m: {'value': f'{m.group(1)}/{m.group(2)} ({m.group(3)}%)', 'unit': '', 'label': ''}),
+]
+
+
+def _extract_numeric_values(text: str) -> list:
+    """Extract numeric values from claim text using regex patterns."""
+    values = []
+    seen = set()
+    for pattern, builder in _NUMERIC_PATTERNS:
+        for m in re.finditer(pattern, text):
+            nv = builder(m)
+            key = nv['value']
+            if key not in seen:
+                seen.add(key)
+                values.append(nv)
+    return values
+
+
+# Heading-based claim type rules
+_CLAIM_TYPE_RULES = [
+    (['warning', 'precaution', 'adverse', 'hemorrhag', 'hepatotox', 'hypertension',
+      'thromboembolic', 'proteinuria', 'erythrodysesthesia', 'embryo', 'fetal',
+      'toxicity', 'reaction'], 'safety'),
+    (['dosage', 'administration', 'dose', 'dosing'], 'dosing'),
+    (['efficacy', 'survival', 'endpoint', 'response', 'progression'], 'efficacy'),
+    (['indication', 'approved'], 'indication'),
+    (['important safety information', 'isi'], 'isi'),
+    (['study', 'trial', 'clinical', 'fresco'], 'study_design'),
+    (['mechanism', 'action', 'pharmacology'], 'moa'),
+    (['nccn', 'guideline', 'recommendation'], 'nccn'),
+]
+
+
+def _infer_claim_type(headings: list, text: str) -> str:
+    """Infer claim type from chunk headings and claim text."""
+    combined = ' '.join(headings).lower() + ' ' + text.lower()
+    for keywords, claim_type in _CLAIM_TYPE_RULES:
+        if any(kw in combined for kw in keywords):
+            return claim_type
+    return 'stat'
+
+
+def _extract_tags(headings: list, text: str) -> list:
+    """Generate concept tags from headings and text."""
+    stop_words = {'the', 'and', 'for', 'from', 'with', 'that', 'this', 'were', 'was',
+                  'are', 'have', 'been', 'see', 'section', 'table', 'figure'}
+    tags = set()
+    # Tags from headings
+    for h in headings:
+        words = re.sub(r'[^a-z0-9\s]', '', h.lower()).split()
+        tags.update(w for w in words if len(w) > 3 and w not in stop_words)
+    # Tags from text (first 200 chars)
+    text_words = re.sub(r'[^a-z0-9\s]', '', text[:200].lower()).split()
+    tags.update(w for w in text_words if len(w) > 3 and w not in stop_words)
+    return list(tags)
+
+
+def extract_claims_from_chunks(chunks_data: list, knowledge_id: int) -> list:
+    """Extract claims deterministically from chunked document elements.
+
+    Each doc_item within a chunk becomes a claim. No LLM involved.
+    Uses the serialized `items` list from parse_document_docling, where each
+    item is a Docling element (TextItem, ListItem, TableItem, etc.) already
+    converted to a dict with text, label, content_format, and page_number.
+
+    Args:
+        chunks_data: list of chunk dicts from parse_document_docling
+        knowledge_id: FK to knowledge_items
+
+    Returns:
+        list of claim dicts ready for DB insertion, each with chunk_id set
+    """
+    all_claims = []
+    seq = 0
+
+    for chunk in chunks_data:
+        chunk_id = chunk['id']
+        headings = chunk.get('headings') or []
+        section_hierarchy = list(headings)
+        section = headings[-1] if headings else None
+        items = chunk.get('items') or []
+
+        for item in items:
+            text = item.get('text', '').strip()
+            if not text or len(text) < 5:
+                continue
+
+            content_format = item.get('content_format', 'text')
+            page_number = item.get('page_number') or chunk.get('page_start')
+
+            claim_type = _infer_claim_type(headings, text)
+            tags = _extract_tags(headings, text)
+
+            if content_format == 'table':
+                if 'table' not in tags:
+                    tags.append('table')
+                claim_id = _make_id(text, claim_type, 90000 + seq)
+                all_claims.append({
+                    'id': claim_id,
+                    'chunk_id': chunk_id,
+                    'knowledge_id': knowledge_id,
+                    'text': text,
+                    'claim_type': claim_type,
+                    'content_format': 'table',
+                    'table_markdown': item.get('table_markdown'),
+                    'table_json': item.get('table_json'),
+                    'section': section,
+                    'section_hierarchy': section_hierarchy,
+                    'page_number': page_number,
+                    'numeric_values': [],
+                    'tags': tags,
+                    'is_approved': True,
+                })
+            else:
+                numeric_values = _extract_numeric_values(text)
+                claim_id = _make_id(text, claim_type, seq)
+                all_claims.append({
+                    'id': claim_id,
+                    'chunk_id': chunk_id,
+                    'knowledge_id': knowledge_id,
+                    'text': text,
+                    'claim_type': claim_type,
+                    'content_format': 'text',
+                    'section': section,
+                    'section_hierarchy': section_hierarchy,
+                    'page_number': page_number,
+                    'numeric_values': numeric_values,
+                    'tags': tags,
+                    'is_approved': True,
+                })
+            seq += 1
+
+    # Deduplicate
+    all_claims = _deduplicate(all_claims)
+
+    logger.info("Extracted %d claims from %d chunks (deterministic)", len(all_claims), len(chunks_data))
+    return all_claims

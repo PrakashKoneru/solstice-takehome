@@ -1766,7 +1766,9 @@ Rules:
 - CRITICAL: Select at most ONE table claim per slide. Pick the table whose caption most closely matches the slide topic. Do NOT select multiple tables.
 - When you select a content_format "table" claim, do NOT also select text claims that duplicate rows from that table. The table claim already contains complete structured data. Only add 1-2 text claims for context or footnotes that are NOT in the table itself.
 - NEVER assign a "table" or "figure" claim to the "headline" role. Visual assets must always be "supporting" body claims. The headline must always be a text claim that frames the visual.
-- Pay close attention to what the table caption says. "adverse reactions" and "laboratory abnormalities" are DIFFERENT tables. Match the table whose caption aligns with the slide topic."""
+- Pay close attention to what the table caption says. "adverse reactions" and "laboratory abnormalities" are DIFFERENT tables. Match the table whose caption aligns with the slide topic.
+- NEVER select a visual claim (content_format "table" or "figure") together with non-footer text claims. If a visual claim is relevant, select ONLY the visual claim (plus one headline text claim to frame it) and no other supporting text claims. Visual assets need their own dedicated slide space.
+- Select at most 8 claims total (including headline and footer)."""
 
 BUILD_SLIDE_SYSTEM = """You are a pharma slide builder. You receive a slide topic, a set of pre-selected claims (with assigned roles), brand guidelines, and component patterns.
 
@@ -1947,14 +1949,18 @@ def _prefilter_claims(claims, slide_plan):
         text_overlap = len(keywords & text_tokens)
         score = tag_overlap * 3 + text_overlap  # tags weighted higher
 
-        # Heavily boost claims from matching document section (check full hierarchy)
+        # Section gate: when a target section is specified, hard-skip claims
+        # that don't belong to that section (prevents cross-section bleed)
         claim_sections = [s.lower() for s in (c.get('section_hierarchy') or [])]
         if not claim_sections:
             # Fallback to flat section for backward compat
             flat = (c.get('section') or '').lower().strip()
             if flat:
                 claim_sections = [flat]
-        if target_section and any(target_section in s for s in claim_sections):
+        if target_section:
+            in_section = any(target_section in s for s in claim_sections)
+            if not in_section:
+                continue  # hard gate: wrong section, skip entirely
             score += 10
 
         # Match topic words against claim text (critical for tables with enriched captions)
@@ -1995,7 +2001,7 @@ def _prefilter_claims(claims, slide_plan):
     content_scored.sort(key=lambda x: x[1], reverse=True)
     top_claims = [c for c, _ in content_scored[:17]]
 
-    # Expand to include ±2 neighboring claims on same page for context
+    # Expand to include ±2 neighboring claims on same page — only for visual claims
     top_ids = {c['id'] for c in top_claims}
     sorted_claims = sorted(
         [c for c in claims if (c.get('claim_type') or '').lower() not in ('isi', 'boilerplate')],
@@ -2003,7 +2009,7 @@ def _prefilter_claims(claims, slide_plan):
     )
     expanded_ids = set(top_ids)
     for i, c in enumerate(sorted_claims):
-        if c['id'] in top_ids:
+        if c['id'] in top_ids and c.get('content_format', 'text') in ('table', 'figure'):
             page = c.get('page_number')
             for offset in (-2, -1, 1, 2):
                 ni = i + offset
@@ -2111,6 +2117,45 @@ def _select_claims(slide_topic, candidate_claims):
                 drop_ids = {s['claim_id'] for s in table_selections[1:]}
                 selected = [s for s in selected if s['claim_id'] not in drop_ids]
                 print(f"[DEBUG] Kept table {keep['claim_id']}, dropped {drop_ids}")
+
+            # Guard: visual claims must not share a slide with other body text claims.
+            # If a visual is selected, keep only: headline + visual + footer claims.
+            visual_selections = [
+                s for s in selected
+                if claims_lookup.get(s['claim_id'], {}).get('content_format', 'text') in ('table', 'figure')
+                and s.get('role') != 'footer'
+            ]
+            if visual_selections:
+                keep_ids = set()
+                # Keep the visual claim
+                for vs in visual_selections:
+                    keep_ids.add(vs['claim_id'])
+                # Keep the headline (if it's a text claim)
+                for s in selected:
+                    if s.get('role') == 'headline' and s['claim_id'] not in keep_ids:
+                        keep_ids.add(s['claim_id'])
+                        break
+                # Keep footer claims
+                for s in selected:
+                    if s.get('role') == 'footer':
+                        keep_ids.add(s['claim_id'])
+                dropped = [s['claim_id'] for s in selected if s['claim_id'] not in keep_ids]
+                if dropped:
+                    selected = [s for s in selected if s['claim_id'] in keep_ids]
+                    print(f"[DEBUG] Visual isolation: kept {keep_ids}, dropped text body claims {dropped}")
+
+            # Guard: max 8 claims per slide (headline + body + footer)
+            if len(selected) > 8:
+                # Keep headline + footer, trim body claims to fit
+                headline = [s for s in selected if s.get('role') == 'headline']
+                footer = [s for s in selected if s.get('role') == 'footer']
+                body = [s for s in selected if s.get('role') not in ('headline', 'footer')]
+                max_body = 8 - len(headline) - len(footer)
+                if len(body) > max_body:
+                    dropped_body = [s['claim_id'] for s in body[max_body:]]
+                    body = body[:max_body]
+                    print(f"[DEBUG] Capped to 8 claims, dropped body claims: {dropped_body}")
+                selected = headline + body + footer
 
             return selected
 
@@ -2362,10 +2407,21 @@ def generate_slide_spec(
         # Step 1a: Programmatic pre-filter
         candidates = _prefilter_claims(claims, slide_plan)
 
-        # Ensure this slide's pinned visuals are in candidates
+        # Ensure this slide's pinned visuals are in candidates (section-gated)
         candidate_ids = {c['id'] for c in candidates}
+        slide_section = (slide_plan.get('section') or '').lower().strip()
         for pv in slide_pinned:
             if pv['id'] not in candidate_ids:
+                # Section gate: skip pinned visuals from wrong sections
+                if slide_section:
+                    pv_sections = [s.lower() for s in (pv.get('section_hierarchy') or [])]
+                    if not pv_sections:
+                        flat = (pv.get('section') or '').lower().strip()
+                        if flat:
+                            pv_sections = [flat]
+                    if pv_sections and not any(slide_section in s for s in pv_sections):
+                        print(f"[DEBUG] Skipped pinned visual {pv['id']} — section mismatch (slide={slide_section}, claim={pv_sections})")
+                        continue
                 candidates.append(pv)
                 print(f"[DEBUG] Injected pinned visual into candidates: {pv['id']}")
 
@@ -2374,10 +2430,20 @@ def generate_slide_spec(
         # Step 1b: LLM strict selection
         selected = _select_claims(topic, candidates)
 
-        # Ensure this slide's pinned visuals are in the selection
+        # Ensure this slide's pinned visuals are in the selection (section-gated)
         selected_ids = {s['claim_id'] for s in selected}
         for pv in slide_pinned:
             if pv['id'] not in selected_ids:
+                # Section gate: skip pinned visuals from wrong sections
+                if slide_section:
+                    pv_sections = [s.lower() for s in (pv.get('section_hierarchy') or [])]
+                    if not pv_sections:
+                        flat = (pv.get('section') or '').lower().strip()
+                        if flat:
+                            pv_sections = [flat]
+                    if pv_sections and not any(slide_section in s for s in pv_sections):
+                        print(f"[DEBUG] Skipped force-add of pinned visual {pv['id']} — section mismatch")
+                        continue
                 selected.append({'claim_id': pv['id'], 'role': 'supporting'})
                 print(f"[DEBUG] Force-added pinned visual to selection: {pv['id']}")
 

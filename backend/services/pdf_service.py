@@ -4,7 +4,6 @@ import re as _re
 import cloudinary
 import cloudinary.uploader
 
-
 def _parse_markdown_table(md: str) -> dict:
     """Parse a markdown table into structured JSON.
 
@@ -697,6 +696,33 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
                 "section": current_section,
             })
 
+    # Merge consecutive table fragments with identical headers (multi-page tables)
+    if len(tables) > 1:
+        merged = [tables[0]]
+        for tbl in tables[1:]:
+            prev = merged[-1]
+            prev_json = prev.get('table_json')
+            curr_json = tbl.get('table_json')
+            # If both have parsed JSON and headers match, merge rows
+            if (prev_json and curr_json
+                    and prev_json.get('headers') == curr_json.get('headers')):
+                prev_json['rows'].extend(curr_json['rows'])
+                # Append markdown too
+                # Strip header row from current markdown before appending
+                curr_lines = tbl['markdown'].strip().split('\n')
+                # Skip header row and separator (first 2 lines)
+                body_lines = [l for l in curr_lines[2:] if l.strip()]
+                if body_lines:
+                    prev['markdown'] += '\n' + '\n'.join(body_lines)
+                # Update context if richer
+                if tbl.get('context') and len(tbl['context']) > len(prev.get('context', '')):
+                    prev['context'] = tbl['context']
+                print(f"[DOCLING-KB] Merged table fragment from page {tbl['page_number']} into table on page {prev['page_number']} ({len(prev_json['rows'])} total rows)")
+            else:
+                merged.append(tbl)
+        print(f"[DOCLING-KB] Table merge: {len(tables)} fragments → {len(merged)} tables")
+        tables = merged
+
     # Label figures with Haiku vision and upload to Cloudinary
     if figures:
         print(f"[DOCLING-KB] Labeling and uploading {len(figures)} figures...")
@@ -784,8 +810,205 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
         except Exception as e:
             print(f"[DOCLING-KB] Heading embedding failed (non-fatal): {e}")
 
+    # Step 2: Collect all content items from iterate_items()
+    all_items = []
+    for item, _level in doc_result.document.iterate_items():
+        if isinstance(item, SectionHeaderItem):
+            continue  # headers are structural, not claims
+        label = item.label.value if hasattr(item.label, 'value') else str(item.label)
+        page_no = item.prov[0].page_no if item.prov else 0
+        self_ref = item.self_ref if hasattr(item, 'self_ref') else None
+
+        if isinstance(item, TableItem):
+            try:
+                md = item.export_to_markdown()
+                tj = _parse_markdown_table(md)
+                all_items.append({
+                    'self_ref': self_ref,
+                    'label': label,
+                    'text': md[:120] if md else 'Table',
+                    'content_format': 'table',
+                    'table_markdown': md,
+                    'table_json': tj,
+                    'page_number': page_no,
+                })
+            except Exception:
+                pass
+        elif isinstance(item, PictureItem):
+            # Pictures handled separately (figures list above)
+            continue
+        else:
+            text = item.text if hasattr(item, 'text') and item.text else None
+            if text and text.strip():
+                all_items.append({
+                    'self_ref': self_ref,
+                    'label': label,
+                    'text': text.strip(),
+                    'content_format': 'text',
+                    'page_number': page_no,
+                })
+
+    print(f"[DOCLING-KB] Collected {len(all_items)} content items from iterate_items()")
+
+    # Step 3: LLM filter — Haiku identifies real content vs junk
+    kept_items = all_items  # fallback: keep all if LLM fails
+    try:
+        import anthropic
+        import json as _json
+        filter_client = anthropic.Anthropic(api_key=os.environ['ANTHROPIC_API_KEY'])
+
+        # Build compact item list for the LLM
+        item_list = []
+        for idx, item in enumerate(all_items):
+            if item['content_format'] == 'table':
+                item_list.append({'i': idx, 'label': item['label'], 'text': '[TABLE]', 'page': item['page_number']})
+            else:
+                item_list.append({'i': idx, 'label': item['label'], 'text': item['text'][:150], 'page': item['page_number']})
+
+        filter_tool = {
+            "name": "filter_items",
+            "description": "Return indices of items that are real document content worth keeping as claims.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "keep_indices": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": "Indices of items to keep"
+                    }
+                },
+                "required": ["keep_indices"]
+            }
+        }
+
+        filter_response = filter_client.messages.create(
+            model='claude-haiku-4-5-20251001',
+            max_tokens=4096,
+            system=(
+                "You are a pharma document analyst. You receive a list of text elements extracted from a pharmaceutical document. "
+                "Return the indices of items that are REAL CONTENT — factual claims, safety statements, efficacy data, "
+                "dosing instructions, study results, adverse reactions, warnings, ISI statements, footnotes with data.\n\n"
+                "EXCLUDE:\n"
+                "- Table of contents lines (contain '...' dots or just section refs with page numbers)\n"
+                "- Page headers/footers that repeat across pages\n"
+                "- Orphan fragments (single words, partial labels like 'Capsules:', 'None.', 'Placebo')\n"
+                "- Bare section references without content (e.g. 'Dosage and Administration (2.2)')\n"
+                "- Chart axis labels or tick marks (e.g. '0.6 -', '0.4 -')\n"
+                "- Copyright/trademark boilerplate\n\n"
+                "ALWAYS KEEP:\n"
+                "- Tables ([TABLE] items) — always keep these\n"
+                "- Any item with clinical data, percentages, or drug information\n"
+                "- Safety warnings and precaution statements\n"
+                "- Footnotes with statistical methodology"
+            ),
+            tools=[filter_tool],
+            tool_choice={"type": "tool", "name": "filter_items"},
+            messages=[{'role': 'user', 'content': f"Filter these document items:\n{_json.dumps(item_list)}"}],
+        )
+
+        for block in filter_response.content:
+            if block.type == 'tool_use' and block.name == 'filter_items':
+                keep_indices = set(block.input.get('keep_indices', []))
+                kept_items = [all_items[idx] for idx in sorted(keep_indices) if idx < len(all_items)]
+                print(f"[DOCLING-KB] LLM filter: {len(all_items)} → {len(kept_items)} items "
+                      f"(removed {len(all_items) - len(kept_items)} junk items)")
+                break
+    except Exception as e:
+        print(f"[DOCLING-KB] LLM filter failed (keeping all items): {e}")
+
+    # Step 4: Chunk with HierarchicalChunker for section grouping
+    chunks_data = []
+    try:
+        from docling.chunking import HierarchicalChunker
+        chunker = HierarchicalChunker(merge_list_items=True)
+        raw_chunks = list(chunker.chunk(doc_result.document))
+        print(f"[DOCLING-KB] HierarchicalChunker produced {len(raw_chunks)} chunks")
+
+        # Build self_ref → chunk mapping from doc_items
+        ref_to_chunk = {}  # self_ref → (chunk_id, headings, chunk_index)
+        chunk_meta = []    # list of chunk metadata dicts
+
+        for i, chunk in enumerate(raw_chunks):
+            headings = chunk.meta.headings or []
+            serialized = chunker.serialize(chunk)
+
+            # Build chunk ID
+            if headings:
+                slug_parts = []
+                for h in headings[-2:]:
+                    words = _re.sub(r'[^a-z0-9\s]', '', str(h).lower()).split()[:3]
+                    slug_parts.extend(words)
+                slug = '_'.join(slug_parts) if slug_parts else f'chunk_{i}'
+            else:
+                slug = f'chunk_{i}'
+            chunk_id = f"chunk_{slug}_{i:03d}"
+
+            # Extract page range and element types
+            element_types = []
+            pages_in_chunk = []
+            for di in (chunk.meta.doc_items or []):
+                label = di.label.value if hasattr(di.label, 'value') else str(di.label)
+                if label not in element_types:
+                    element_types.append(label)
+                for prov in (di.prov or []):
+                    if hasattr(prov, 'page_no'):
+                        pages_in_chunk.append(prov.page_no)
+                # Map self_ref to this chunk
+                if hasattr(di, 'self_ref') and di.self_ref:
+                    ref_to_chunk[di.self_ref] = chunk_id
+
+            has_table = 'table' in element_types
+            has_figure = 'picture' in element_types or 'chart' in element_types
+            page_start = min(pages_in_chunk) if pages_in_chunk else None
+            page_end = max(pages_in_chunk) if pages_in_chunk else None
+
+            chunk_meta.append({
+                'id': chunk_id,
+                'headings': headings,
+                'serialized_text': serialized,
+                'text': chunk.text,
+                'element_types': element_types,
+                'has_table': has_table,
+                'has_figure': has_figure,
+                'page_start': page_start,
+                'page_end': page_end,
+            })
+
+        # Step 5: Assign filtered items to chunks via self_ref mapping
+        chunk_items = {}  # chunk_id → list of item dicts
+        orphan_items = []
+        for item in kept_items:
+            ref = item.get('self_ref')
+            cid = ref_to_chunk.get(ref) if ref else None
+            if cid:
+                chunk_items.setdefault(cid, []).append(item)
+            else:
+                orphan_items.append(item)
+
+        if orphan_items:
+            print(f"[DOCLING-KB] {len(orphan_items)} items not mapped to any chunk (orphans)")
+
+        # Build final chunks_data with their items
+        for cm in chunk_meta:
+            cm['items'] = chunk_items.get(cm['id'], [])
+            chunks_data.append(cm)
+
+        mapped_count = sum(len(cm['items']) for cm in chunks_data)
+        print(f"[DOCLING-KB] Mapped {mapped_count} items to {len(chunks_data)} chunks")
+
+        for i, cm in enumerate(chunks_data):
+            if cm['items']:
+                print(f"[DOCLING-KB] Chunk {i}: {' > '.join(cm['headings']) if cm['headings'] else '(no headings)'} "
+                      f"| {len(cm['items'])} items | pages={cm['page_start']}-{cm['page_end']}")
+
+    except Exception as e:
+        print(f"[DOCLING-KB] HierarchicalChunker failed: {e}")
+        import traceback
+        traceback.print_exc()
+
     print(f"[DOCLING-KB] Done. {len(pages)} pages, {len(doc_outline)} outline entries, "
-          f"{len(tables)} tables, {len(figures)} figures")
+          f"{len(tables)} tables, {len(figures)} figures, {len(chunks_data)} chunks, "
+          f"{len(kept_items)} filtered items")
 
     return {
         "pages": pages,
@@ -793,6 +1016,7 @@ def parse_document_docling(filepath: str, upload_dir: str) -> dict:
         "doc_outline": doc_outline,
         "tables": tables,
         "figures": figures,
+        "chunks": chunks_data,
         "total_pages": total_pages if isinstance(total_pages, int) else len(pages),
     }
 

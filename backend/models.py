@@ -136,10 +136,43 @@ class DesignSystemAsset(db.Model):
         }
 
 
+class Chunk(db.Model):
+    __tablename__ = 'chunks'
+
+    id              = db.Column(db.String(64), primary_key=True)
+    knowledge_id    = db.Column(db.Integer, db.ForeignKey('knowledge_items.id', ondelete='CASCADE'), nullable=False)
+    headings        = db.Column(db.JSON, nullable=True)       # ["5. WARNINGS", "5.2 Hemorrhagic Events"]
+    serialized_text = db.Column(db.Text, nullable=True)       # heading path + content (what's embedded)
+    element_types   = db.Column(db.JSON, nullable=True)       # ["paragraph", "list_item", "table"]
+    has_table       = db.Column(db.Boolean, default=False)
+    has_figure      = db.Column(db.Boolean, default=False)
+    page_start      = db.Column(db.Integer, nullable=True)
+    page_end        = db.Column(db.Integer, nullable=True)
+    embedding       = db.Column(db.JSON, nullable=True)
+    created_at      = db.Column(db.DateTime, default=datetime.utcnow)
+
+    claims = db.relationship('Claim', backref='chunk', lazy=True, cascade='all, delete-orphan')
+
+    def to_dict(self):
+        return {
+            'id':              self.id,
+            'knowledge_id':    self.knowledge_id,
+            'headings':        self.headings or [],
+            'serialized_text': self.serialized_text,
+            'element_types':   self.element_types or [],
+            'has_table':       self.has_table,
+            'has_figure':      self.has_figure,
+            'page_start':      self.page_start,
+            'page_end':        self.page_end,
+            'created_at':      self.created_at.isoformat(),
+        }
+
+
 class Claim(db.Model):
     __tablename__ = 'claims'
 
     id              = db.Column(db.String(64), primary_key=True)   # "{drug}_{type}_{study}_{seq}"
+    chunk_id        = db.Column(db.String(64), db.ForeignKey('chunks.id', ondelete='SET NULL'), nullable=True)
     knowledge_id    = db.Column(db.Integer, db.ForeignKey('knowledge_items.id', ondelete='CASCADE'), nullable=False)
     text            = db.Column(db.Text, nullable=False)           # verbatim, immutable after approval
     claim_type      = db.Column(db.String(32), nullable=False)
@@ -162,6 +195,7 @@ class Claim(db.Model):
     def to_dict(self):
         return {
             'id':              self.id,
+            'chunk_id':        self.chunk_id,
             'knowledge_id':    self.knowledge_id,
             'text':            self.text,
             'claim_type':      self.claim_type,
